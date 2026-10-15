@@ -1,0 +1,152 @@
+# KRaft controller quorum: 3 voters, so it survives the loss of any one.
+# Pods are kafka-controller-{0,1,2} with node ids 1, 2, 3.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-controller-headless
+  labels:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: controller
+spec:
+  clusterIP: None
+  # Voters must resolve each other before they are ready, or no leader is ever elected.
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: controller
+  ports:
+    - name: controller
+      port: 9093
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka-controller
+  labels:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: controller
+spec:
+  serviceName: kafka-controller-headless
+  replicas: 3
+  # Start all voters together; the quorum needs a majority before anything works.
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kafka
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kafka
+        app.kubernetes.io/component: controller
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      # One voter per node and per zone, so one failure never removes two voters.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafka
+              app.kubernetes.io/component: controller
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: kafka
+                  app.kubernetes.io/component: controller
+      containers:
+        - name: kafka
+          image: apache/kafka
+          command: ["/etc/kafka/scripts/kafka-entrypoint.sh"]
+          env:
+            - name: KAFKA_ROLE
+              value: controller
+            - name: NODE_ID_OFFSET
+              value: "1"
+            - name: CLUSTER_ID
+              valueFrom:
+                configMapKeyRef: { name: kafka-cluster, key: CLUSTER_ID }
+            - name: QUORUM_VOTERS
+              value: >-
+                1@kafka-controller-0.kafka-controller-headless.kafka.svc.cluster.local:9093,2@kafka-controller-1.kafka-controller-headless.kafka.svc.cluster.local:9093,3@kafka-controller-2.kafka-controller-headless.kafka.svc.cluster.local:9093
+            - name: KAFKA_HEAP_OPTS
+              value: "-Xms1g -Xmx1g"
+            - name: LOG_DIR
+              value: /var/log/kafka
+          ports:
+            - name: controller
+              containerPort: 9093
+          resources:
+            requests: { cpu: 500m, memory: 2Gi }
+            limits: { memory: 2Gi }
+          startupProbe:
+            tcpSocket: { port: controller }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            tcpSocket: { port: controller }
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: controller }
+            periodSeconds: 20
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/kafka/data }
+            - { name: templates, mountPath: /etc/kafka/templates, readOnly: true }
+            - { name: scripts, mountPath: /etc/kafka/scripts, readOnly: true }
+            - { name: node-tls, mountPath: /etc/kafka/secrets, readOnly: true }
+            - { name: runtime, mountPath: /etc/kafka/runtime }
+            - { name: logs, mountPath: /var/log/kafka }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: templates
+          configMap: { name: kafka-templates }
+        - name: scripts
+          configMap: { name: kafka-scripts, defaultMode: 0555 }
+        - name: node-tls
+          secret: { secretName: kafka-node-tls, defaultMode: 0440 }
+        - name: runtime
+          emptyDir: {}
+        - name: logs
+          emptyDir: { sizeLimit: 1Gi }
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # storageClassName: fast-ssd   # use an SSD-backed class in production
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kafka-controller
+spec:
+  # Never let voluntary disruptions (node drains, upgrades) take the quorum below a majority.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kafka
+      app.kubernetes.io/component: controller

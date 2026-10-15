@@ -1,0 +1,185 @@
+# Brokers: pods kafka-broker-{0,1,2} with node ids 101, 102, 103.
+# Applications in the cluster bootstrap from kafka.kafka.svc:9092 (SASL_SSL, SCRAM-SHA-512).
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-broker-headless
+  labels:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: broker
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: broker
+  ports:
+    - { name: internal, port: 9091 }
+    - { name: client, port: 9092 }
+---
+# Bootstrap only: clients use it for the first metadata request, then connect to each
+# broker by its advertised pod DNS name.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  labels:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: broker
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: broker
+  ports:
+    - { name: client, port: 9092, targetPort: client }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka-broker
+  labels:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: broker
+spec:
+  serviceName: kafka-broker-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kafka
+      app.kubernetes.io/component: broker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kafka
+        app.kubernetes.io/component: broker
+    spec:
+      # Controlled shutdown moves every partition leadership off the broker first.
+      terminationGracePeriodSeconds: 300
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafka
+              app.kubernetes.io/component: broker
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: kafka
+                  app.kubernetes.io/component: broker
+      containers:
+        - name: kafka
+          image: apache/kafka
+          command: ["/etc/kafka/scripts/kafka-entrypoint.sh"]
+          env:
+            - name: KAFKA_ROLE
+              value: broker
+            - name: NODE_ID_OFFSET
+              value: "101"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+            - name: CLUSTER_ID
+              valueFrom:
+                configMapKeyRef: { name: kafka-cluster, key: CLUSTER_ID }
+            - name: QUORUM_VOTERS
+              value: >-
+                1@kafka-controller-0.kafka-controller-headless.kafka.svc.cluster.local:9093,2@kafka-controller-1.kafka-controller-headless.kafka.svc.cluster.local:9093,3@kafka-controller-2.kafka-controller-headless.kafka.svc.cluster.local:9093
+            - name: LISTENERS
+              value: INTERNAL://0.0.0.0:9091,CLIENT://0.0.0.0:9092
+            - name: ADVERTISED_LISTENERS
+              value: >-
+                INTERNAL://$(POD_NAME).kafka-broker-headless.kafka.svc.cluster.local:9091,CLIENT://$(POD_NAME).kafka-broker-headless.kafka.svc.cluster.local:9092
+            # Ideally the node's zone (topology.kubernetes.io/zone). Pods cannot read node
+            # labels through the downward API; see deploy/README.md for how to wire it up.
+            - name: BROKER_RACK
+              value: $(POD_NAME)
+            - name: KAFKA_HEAP_OPTS
+              value: "-Xms6g -Xmx6g"
+            - name: NUM_NETWORK_THREADS
+              value: "3"
+            - name: NUM_IO_THREADS
+              value: "8"
+            - name: LOG_DIR
+              value: /var/log/kafka
+          ports:
+            - { name: internal, containerPort: 9091 }
+            - { name: client, containerPort: 9092 }
+          # Heap 6g; the rest of the memory limit is page cache, which serves most reads.
+          resources:
+            requests: { cpu: "2", memory: 16Gi }
+            limits: { memory: 16Gi }
+          # Log recovery after an unclean shutdown can take minutes on a large broker.
+          startupProbe:
+            tcpSocket: { port: client }
+            periodSeconds: 10
+            failureThreshold: 90
+          readinessProbe:
+            tcpSocket: { port: client }
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: client }
+            periodSeconds: 20
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/kafka/data }
+            - { name: templates, mountPath: /etc/kafka/templates, readOnly: true }
+            - { name: scripts, mountPath: /etc/kafka/scripts, readOnly: true }
+            - { name: node-tls, mountPath: /etc/kafka/secrets, readOnly: true }
+            - { name: runtime, mountPath: /etc/kafka/runtime }
+            - { name: logs, mountPath: /var/log/kafka }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: templates
+          configMap: { name: kafka-templates }
+        - name: scripts
+          configMap: { name: kafka-scripts, defaultMode: 0555 }
+        - name: node-tls
+          secret: { secretName: kafka-node-tls, defaultMode: 0440 }
+        - name: runtime
+          emptyDir: {}
+        - name: logs
+          emptyDir: { sizeLimit: 1Gi }
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # storageClassName: fast-ssd   # use an SSD-backed class in production
+        resources:
+          requests:
+            storage: 200Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kafka-broker
+spec:
+  # With RF 3 and min.insync.replicas 2, losing one broker keeps every partition writable.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kafka
+      app.kubernetes.io/component: broker

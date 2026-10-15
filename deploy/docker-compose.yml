@@ -1,0 +1,233 @@
+# Kafka 4.x, KRaft, 3 dedicated controllers + 3 brokers, TLS everywhere, SCRAM for clients,
+# ACLs with default deny, replication factor 3 / min.insync.replicas 2.
+#
+#   ./scripts/gen-certs.sh                  # once: CA, keystores, passwords into secrets/
+#   docker compose up -d                    # start the cluster, then run the init job
+#   docker compose logs -f kafka-init       # watch users, topics and ACLs being created
+#
+# Applications on your machine connect to localhost:19092,localhost:29092,localhost:39092
+# with SASL_SSL / SCRAM-SHA-512 as user "app" (see deploy/README.md).
+
+name: kafka
+
+x-kafka-node: &kafka-node
+  image: ${KAFKA_IMAGE}
+  entrypoint: ["/etc/kafka/scripts/kafka-entrypoint.sh"]
+  restart: unless-stopped
+  init: true
+  # Root filesystem is read-only; only the data volume and the tmpfs mounts are writable.
+  read_only: true
+  tmpfs:
+    - /tmp
+    - /etc/kafka/runtime
+    - /var/log/kafka
+  ulimits:
+    nofile: { soft: 100000, hard: 100000 }
+  # A clean shutdown moves leaderships away first and skips log recovery on restart.
+  stop_grace_period: 120s
+  stop_signal: SIGTERM
+  logging:
+    driver: json-file
+    options: { max-size: "50m", max-file: "5" }
+  networks: [kafka]
+
+x-controller-env: &controller-env
+  KAFKA_ROLE: controller
+  CLUSTER_ID: ${CLUSTER_ID}
+  QUORUM_VOTERS: 1@controller-1:9093,2@controller-2:9093,3@controller-3:9093
+  KAFKA_HEAP_OPTS: ${CONTROLLER_HEAP}
+  LOG_DIR: /var/log/kafka
+
+x-broker-env: &broker-env
+  KAFKA_ROLE: broker
+  CLUSTER_ID: ${CLUSTER_ID}
+  QUORUM_VOTERS: 1@controller-1:9093,2@controller-2:9093,3@controller-3:9093
+  KAFKA_HEAP_OPTS: ${BROKER_HEAP}
+  LOG_DIR: /var/log/kafka
+  NUM_NETWORK_THREADS: ${NUM_NETWORK_THREADS}
+  NUM_IO_THREADS: ${NUM_IO_THREADS}
+
+x-common-mounts:
+  - &templates ./config:/etc/kafka/templates:ro
+  - &scripts ./scripts:/etc/kafka/scripts:ro
+  - &ca ./secrets/ca.crt:/etc/kafka/secrets/ca.crt:ro
+  - &node-credentials ./secrets/node-credentials.properties:/etc/kafka/secrets/node-credentials.properties:ro
+
+x-controller-healthcheck: &controller-healthcheck
+  test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/9093"]
+  interval: 10s
+  timeout: 5s
+  retries: 6
+  start_period: 30s
+
+x-broker-healthcheck: &broker-healthcheck
+  test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/9092"]
+  interval: 10s
+  timeout: 5s
+  retries: 6
+  start_period: 60s
+
+x-controller-resources: &controller-resources
+  resources:
+    limits: { memory: "${CONTROLLER_MEMORY}" }
+    reservations: { memory: "${CONTROLLER_MEMORY}" }
+
+x-broker-resources: &broker-resources
+  resources:
+    limits: { cpus: "${BROKER_CPUS}", memory: "${BROKER_MEMORY}" }
+    reservations: { memory: "${BROKER_MEMORY}" }
+
+services:
+
+  # ---------------------------------------------------------------- controllers
+
+  controller-1:
+    <<: *kafka-node
+    hostname: controller-1
+    environment:
+      <<: *controller-env
+      NODE_ID: 1
+    volumes:
+      - *templates
+      - *scripts
+      - *ca
+      - *node-credentials
+      - ./secrets/controller-1.p12:/etc/kafka/secrets/node.p12:ro
+      - controller-1-data:/var/lib/kafka/data
+    healthcheck: *controller-healthcheck
+    deploy: *controller-resources
+
+  controller-2:
+    <<: *kafka-node
+    hostname: controller-2
+    environment:
+      <<: *controller-env
+      NODE_ID: 2
+    volumes:
+      - *templates
+      - *scripts
+      - *ca
+      - *node-credentials
+      - ./secrets/controller-2.p12:/etc/kafka/secrets/node.p12:ro
+      - controller-2-data:/var/lib/kafka/data
+    healthcheck: *controller-healthcheck
+    deploy: *controller-resources
+
+  controller-3:
+    <<: *kafka-node
+    hostname: controller-3
+    environment:
+      <<: *controller-env
+      NODE_ID: 3
+    volumes:
+      - *templates
+      - *scripts
+      - *ca
+      - *node-credentials
+      - ./secrets/controller-3.p12:/etc/kafka/secrets/node.p12:ro
+      - controller-3-data:/var/lib/kafka/data
+    healthcheck: *controller-healthcheck
+    deploy: *controller-resources
+
+  # ---------------------------------------------------------------- brokers
+
+  broker-1:
+    <<: *kafka-node
+    hostname: broker-1
+    environment:
+      <<: *broker-env
+      NODE_ID: 101
+      BROKER_RACK: rack-a
+      LISTENERS: INTERNAL://0.0.0.0:9091,CLIENT://0.0.0.0:9092,EXTERNAL://0.0.0.0:19092
+      ADVERTISED_LISTENERS: INTERNAL://broker-1:9091,CLIENT://broker-1:9092,EXTERNAL://localhost:19092
+    ports:
+      - "127.0.0.1:19092:19092"
+    volumes:
+      - *templates
+      - *scripts
+      - *ca
+      - *node-credentials
+      - ./secrets/broker-1.p12:/etc/kafka/secrets/node.p12:ro
+      - broker-1-data:/var/lib/kafka/data
+    healthcheck: *broker-healthcheck
+    deploy: *broker-resources
+    depends_on: &on-controllers
+      controller-1: { condition: service_healthy }
+      controller-2: { condition: service_healthy }
+      controller-3: { condition: service_healthy }
+
+  broker-2:
+    <<: *kafka-node
+    hostname: broker-2
+    environment:
+      <<: *broker-env
+      NODE_ID: 102
+      BROKER_RACK: rack-b
+      LISTENERS: INTERNAL://0.0.0.0:9091,CLIENT://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092
+      ADVERTISED_LISTENERS: INTERNAL://broker-2:9091,CLIENT://broker-2:9092,EXTERNAL://localhost:29092
+    ports:
+      - "127.0.0.1:29092:29092"
+    volumes:
+      - *templates
+      - *scripts
+      - *ca
+      - *node-credentials
+      - ./secrets/broker-2.p12:/etc/kafka/secrets/node.p12:ro
+      - broker-2-data:/var/lib/kafka/data
+    healthcheck: *broker-healthcheck
+    deploy: *broker-resources
+    depends_on: *on-controllers
+
+  broker-3:
+    <<: *kafka-node
+    hostname: broker-3
+    environment:
+      <<: *broker-env
+      NODE_ID: 103
+      BROKER_RACK: rack-c
+      LISTENERS: INTERNAL://0.0.0.0:9091,CLIENT://0.0.0.0:9092,EXTERNAL://0.0.0.0:39092
+      ADVERTISED_LISTENERS: INTERNAL://broker-3:9091,CLIENT://broker-3:9092,EXTERNAL://localhost:39092
+    ports:
+      - "127.0.0.1:39092:39092"
+    volumes:
+      - *templates
+      - *scripts
+      - *ca
+      - *node-credentials
+      - ./secrets/broker-3.p12:/etc/kafka/secrets/node.p12:ro
+      - broker-3-data:/var/lib/kafka/data
+    healthcheck: *broker-healthcheck
+    deploy: *broker-resources
+    depends_on: *on-controllers
+
+  # ---------------------------------------------------------------- one-shot setup
+
+  kafka-init:
+    image: ${KAFKA_IMAGE}
+    entrypoint: ["/etc/kafka/scripts/init-cluster.sh"]
+    restart: "no"
+    environment:
+      BOOTSTRAP_SERVERS: broker-1:9091,broker-2:9091,broker-3:9091
+    volumes:
+      - *scripts
+      - *ca
+      - ./config/admin.properties:/etc/kafka/admin/admin.properties:ro
+      - ./secrets/admin.p12:/etc/kafka/secrets/admin.p12:ro
+      - ./secrets/admin-credentials.properties:/etc/kafka/secrets/admin-credentials.properties:ro
+    networks: [kafka]
+    depends_on:
+      broker-1: { condition: service_healthy }
+      broker-2: { condition: service_healthy }
+      broker-3: { condition: service_healthy }
+
+networks:
+  kafka:
+    name: kafka
+
+volumes:
+  controller-1-data:
+  controller-2-data:
+  controller-3-data:
+  broker-1-data:
+  broker-2-data:
+  broker-3-data:

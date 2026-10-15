@@ -1,0 +1,57 @@
+# Kubernetes entry point. It lives at deploy/ (not deploy/k8s/) so it can share the
+# config templates, scripts and generated secrets with docker-compose.yml.
+#
+#   ./scripts/gen-certs.sh             # once
+#   kubectl apply -k deploy/
+#   kubectl -n kafka logs -f job/kafka-init
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: kafka
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: kafka
+    includeSelectors: false
+
+resources:
+  - k8s/namespace.yaml
+  - k8s/controller.yaml
+  - k8s/broker.yaml
+  - k8s/init-job.yaml
+  - k8s/network-policy.yaml
+
+images:
+  - name: apache/kafka
+    newTag: 4.4.0
+
+configMapGenerator:
+  - name: kafka-templates
+    files:
+      - controller.properties=config/controller.properties
+      - broker.properties=config/broker.properties
+  - name: kafka-scripts
+    files:
+      - kafka-entrypoint.sh=scripts/kafka-entrypoint.sh
+      - init-cluster.sh=scripts/init-cluster.sh
+  - name: kafka-admin-config
+    files:
+      - admin.properties=config/admin.properties
+  - name: kafka-cluster
+    literals:
+      # One id for the life of the cluster. New cluster: bin/kafka-storage.sh random-uuid
+      - CLUSTER_ID=JyM8fjpPROuic6KuRywfKw
+
+secretGenerator:
+  # Mounted by every controller and broker.
+  - name: kafka-node-tls
+    files:
+      - ca.crt=secrets/ca.crt
+      - node.p12=secrets/kafka-node.p12
+      - node-credentials.properties=secrets/node-credentials.properties
+  # Mounted only by the init job (and by you, for admin tools).
+  - name: kafka-admin-tls
+    files:
+      - ca.crt=secrets/ca.crt
+      - admin.p12=secrets/admin.p12
+      - admin-credentials.properties=secrets/admin-credentials.properties

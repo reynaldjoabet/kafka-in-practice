@@ -1,0 +1,58 @@
+# Default deny for Kafka pods, then open exactly the paths Kafka uses.
+# Requires a CNI that enforces NetworkPolicy (Calico, Cilium, ...).
+
+# Controllers: port 9093 from other controllers and from brokers only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kafka-controller
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: kafka
+      app.kubernetes.io/component: controller
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafka
+              app.kubernetes.io/component: controller
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafka
+              app.kubernetes.io/component: broker
+      ports:
+        - { port: 9093, protocol: TCP }
+---
+# Brokers: INTERNAL (9091) from brokers and the init job; CLIENT (9092) from any
+# namespace labelled kafka-access=true, and from inside this namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kafka-broker
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: kafka
+      app.kubernetes.io/component: broker
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafka
+              app.kubernetes.io/component: broker
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafka
+              app.kubernetes.io/component: init
+      ports:
+        - { port: 9091, protocol: TCP }
+    - from:
+        - podSelector: {}
+        - namespaceSelector:
+            matchLabels:
+              kafka-access: "true"
+      ports:
+        - { port: 9092, protocol: TCP }

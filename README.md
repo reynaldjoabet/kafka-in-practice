@@ -40,6 +40,32 @@ Companion document: [tiered-storage-and-security.md](tiered-storage-and-security
 18. [Configs that matter](#18-configs-that-matter)
 19. [Where it lives in the code](#19-where-it-lives-in-the-code)
 
+**Part 6: Under the hood**
+
+20. [The record batch format](#20-the-record-batch-format)
+21. [Inside a broker: how a request is processed](#21-inside-a-broker-how-a-request-is-processed)
+22. [The storage engine: page cache, zero-copy, and durability](#22-the-storage-engine-page-cache-zero-copy-and-durability)
+
+**Part 7: Designing with Kafka**
+
+23. [Topic and partition design](#23-topic-and-partition-design)
+24. [Keys, schemas, and message size](#24-keys-schemas-and-message-size)
+25. [Reliability patterns](#25-reliability-patterns)
+26. [Kafka Streams](#26-kafka-streams)
+27. [Kafka Connect](#27-kafka-connect)
+28. [Multiple clusters and disaster recovery](#28-multiple-clusters-and-disaster-recovery)
+
+**Part 8: Running Kafka**
+
+29. [Performance tuning](#29-performance-tuning)
+30. [Operations runbook](#30-operations-runbook)
+31. [Monitoring: the metrics that matter](#31-monitoring-the-metrics-that-matter)
+32. [Troubleshooting playbook](#32-troubleshooting-playbook)
+33. [Testing Kafka applications](#33-testing-kafka-applications)
+34. [Anti-patterns](#34-anti-patterns)
+35. [Self-test](#35-self-test)
+36. [Where to go next](#36-where-to-go-next)
+
 ---
 
 ## The one idea behind everything
@@ -1143,3 +1169,658 @@ Paths are relative to the root of the Kafka source tree.
 | Wire protocol | `clients/src/main/resources/common/message/*.json`, e.g. `ProduceRequest.json`, `FetchRequest.json`, `ConsumerGroupHeartbeatRequest.json`, `VoteRequest.json` |
 
 **A good reading order:** read the message JSON files first, because they show exactly what each side sends. Then read the client class that sends the request, then the broker class that handles it.
+
+---
+
+# Part 6: Under the hood
+
+Parts 1–5 explain what Kafka does. Part 6 explains how it does it fast. This is the level where you can reason about latency numbers and disk usage instead of guessing.
+
+## 20. The record batch format
+
+Kafka never stores or sends single records. The unit on disk, on the wire, and in the producer's buffer is the **record batch**. The broker writes the batch the producer sent almost byte for byte, and a consumer receives the same bytes. That is why the broker can serve reads without decoding them.
+
+```
+RecordBatch (61-byte header, then the records)
+┌──────────────────────┬────────┬─────────────────────────────────────────────────┐
+│ BaseOffset           │ int64  │ offset of the first record (set by the leader)  │
+│ Length               │ int32  │ size of the rest of the batch                   │
+│ PartitionLeaderEpoch │ int32  │ leader epoch when it was appended               │
+│ Magic                │ int8   │ format version, 2                               │
+│ CRC                  │ uint32 │ checksum of everything after this field         │
+│ Attributes           │ int16  │ compression, timestamp type, transactional,     │
+│                      │        │ control flag                                    │
+│ LastOffsetDelta      │ int32  │ last record's offset minus BaseOffset           │
+│ BaseTimestamp        │ int64  │ first record's timestamp                        │
+│ MaxTimestamp         │ int64  │ largest timestamp in the batch                  │
+│ ProducerId           │ int64  │ ┐                                               │
+│ ProducerEpoch        │ int16  │ ├ idempotence and transactions                  │
+│ BaseSequence         │ int32  │ ┘                                               │
+│ RecordsCount         │ int32  │ number of records                               │
+│ Records              │ ...    │ compressed together as one block                │
+└──────────────────────┴────────┴─────────────────────────────────────────────────┘
+
+Record (each one inside Records)
+┌──────────────────────┬────────────────┬──────────────────────────────────────────┐
+│ Length               │ varint         │ size of this record                      │
+│ Attributes           │ int8           │ unused                                   │
+│ TimestampDelta       │ varlong        │ timestamp minus BaseTimestamp            │
+│ OffsetDelta          │ varint         │ offset minus BaseOffset                  │
+│ Key                  │ varint + bytes │ length, then bytes (-1 = null)           │
+│ Value                │ varint + bytes │ length, then bytes (-1 = null)           │
+│ Headers              │ varint + list  │ count, then key/value pairs              │
+└──────────────────────┴────────────────┴──────────────────────────────────────────┘
+```
+
+Why this layout matters:
+
+- **Per-batch, not per-record, overhead.** Producer id, epoch, sequence, timestamps, and the CRC are stored once per batch. Each record stores only small varint *deltas*. Bigger batches therefore mean less overhead per record.
+- **Compression covers the whole batch.** Similar records compress well together. A batch of one record barely compresses at all.
+- **Offsets are assigned by the broker.** The producer sends the batch with `BaseOffset = 0`. The leader overwrites `BaseOffset` with the next offset in the log and recomputes nothing else, because every record stores only an offset delta.
+- **Control records** (transaction commit and abort markers) are batches with the control flag set. Consumers skip them, but they still use an offset. That is why offsets in a transactional topic have gaps.
+- **Headers** belong to each record. Use them for metadata such as trace ids, schema ids, or the dead-letter information this project's `EventConsumer` adds.
+
+The format is defined in `clients/src/main/java/org/apache/kafka/common/record/internal/DefaultRecordBatch.java` and `DefaultRecord.java`. To see real batches on disk:
+
+```bash
+bin/kafka-dump-log.sh --files /var/lib/kafka/data/orders-0/00000000000000000000.log \
+  --deep-iteration --print-data-log
+```
+
+## 21. Inside a broker: how a request is processed
+
+Every request, whether Produce, Fetch, or Heartbeat, goes through the same pipeline. Knowing it lets you read the broker's latency metrics and say exactly where time is spent.
+
+```mermaid
+flowchart LR
+    C["Client"] -- "TCP" --> A["Acceptor thread<br/>(one per listener)"]
+    A --> N["Network threads<br/>num.network.threads = 3<br/>read and write sockets"]
+    N -- "enqueue" --> RQ[("Request queue<br/>queued.max.requests = 500")]
+    RQ --> H["I/O (handler) threads<br/>num.io.threads = 8<br/>KafkaApis: append, read, ..."]
+    H -- "must wait for something" --> P["Purgatory<br/>DelayedProduce, DelayedFetch"]
+    P -- "condition met or timeout" --> RS
+    H -- "done now" --> RS[("Response queue<br/>(one per network thread)")]
+    RS --> N
+    N -- "TCP" --> C
+```
+
+- **Network threads** only move bytes between sockets and queues. They never touch the log.
+- **I/O threads** (request handlers) do the real work in `KafkaApis`: appending to the log, reading from it, coordinator logic.
+- **Purgatory** holds requests that cannot finish yet, without blocking a thread:
+  - **DelayedProduce:** an `acks=all` produce waiting for followers to replicate the batch.
+  - **DelayedFetch:** a consumer fetch waiting until `fetch.min.bytes` of data are available or `fetch.max.wait.ms` passes. This is Kafka's long polling.
+  - Delayed requests are tracked with a hierarchical timing wheel, so millions of pending timeouts are cheap.
+
+### Reading the latency breakdown
+
+For every request type, the broker publishes `kafka.network:type=RequestMetrics,name=<metric>,request=<Produce|Fetch|...>`:
+
+```
+TotalTimeMs = RequestQueueTimeMs + LocalTimeMs + RemoteTimeMs + ThrottleTimeMs + ResponseQueueTimeMs + ResponseSendTimeMs
+```
+
+| Component | Time spent | If it is high |
+|---|---|---|
+| `RequestQueueTimeMs` | Waiting for a free I/O thread | I/O threads are saturated. Check `RequestHandlerAvgIdlePercent`. |
+| `LocalTimeMs` | Leader doing the work (append or read) | Slow disk, page cache misses, lock contention |
+| `RemoteTimeMs` | In purgatory | Produce: followers are slow to replicate. Fetch: normal long-poll waiting. |
+| `ThrottleTimeMs` | Quota throttling | A client exceeds its quota |
+| `ResponseQueueTimeMs` | Waiting for a network thread | Network threads are saturated. Check `NetworkProcessorAvgIdlePercent`. |
+| `ResponseSendTimeMs` | Writing the response to the socket | Slow client or network |
+
+For example: produce p99 is 200 ms, and almost all of it is `RemoteTimeMs`. The leader is waiting for followers, so look at replica fetchers and follower disks, not at the leader.
+
+## 22. The storage engine: page cache, zero-copy, and durability
+
+### Kafka relies on the OS page cache
+
+Kafka does not keep its own cache of records. Writes go to the file system, which places them in the OS **page cache** (RAM) and writes them to disk in the background. Reads of recent data are served from the same page cache.
+
+```
+   producer ──► broker JVM ──write()──► page cache (RAM) ──later──► disk
+                                              │
+   consumer ◄── socket ◄──sendfile()──────────┘   (tail reads never touch the disk)
+```
+
+Consequences:
+
+- **Give Kafka a small JVM heap and a lot of free RAM.** A broker typically runs with a 6 GB heap on a machine with 64 GB or more. The rest becomes page cache.
+- **Consumers that keep up are almost free.** They read what was just written, straight from memory.
+- **Lagging consumers are expensive.** Reading old data pulls it from disk and can push the hot tail out of the page cache, which slows every other consumer. Tiered storage and separate clusters for replay-heavy workloads are the usual fixes.
+
+### Zero-copy
+
+For plaintext connections, the broker sends log data to a consumer with `sendfile()`, a system call that copies directly from the page cache to the socket without passing through the JVM. This is why the broker does not decode or recompress batches on reads. **TLS disables zero-copy**, because the data must be encrypted in user space, so TLS costs more CPU on the broker.
+
+### Durability comes from replication, not fsync
+
+By default Kafka **does not call fsync** on each write (`flush.messages` and `flush.ms` default to "never"; the OS flushes when it chooses). A batch acknowledged with `acks=all` is in the page cache of every in-sync replica, not necessarily on any disk.
+
+Kafka accepts this because losing data would require every ISR replica to lose power at the same moment, before the OS flushes. Spreading replicas across racks or availability zones (`broker.rack`) makes that very unlikely. Forcing fsync per message costs a lot of throughput for little extra safety.
+
+### Recovery after an unclean shutdown
+
+If a broker crashes, the tail of its active segment may be incomplete. On restart, the broker scans segments written after the last recovery checkpoint, validates each batch's CRC, rebuilds indexes, and truncates anything corrupt. Recovery runs `num.recovery.threads.per.data.dir` (2) threads per log directory. On brokers with many partitions this can take minutes, so raise that value. A clean shutdown writes a marker file that skips this scan.
+
+### Indexes and timestamps
+
+- The offset index is **sparse**: one entry every `index.interval.bytes` (4096 bytes) of log. Finding an offset is a binary search in the index followed by a short scan of the segment.
+- Each record has a timestamp. `message.timestamp.type=CreateTime` (the default) keeps the producer's timestamp. `LogAppendTime` makes the broker overwrite it with its own clock, which is safer for time-based retention when producer clocks cannot be trusted.
+- Time-based retention deletes a segment when its **largest** timestamp is older than `retention.ms`. One record with a timestamp far in the future can keep a whole segment alive. `log.message.timestamp.after.max.ms` rejects such records.
+
+---
+
+# Part 7: Designing with Kafka
+
+## 23. Topic and partition design
+
+### How many partitions?
+
+Choose the partition count for the highest throughput and largest consumer group you expect, because changing it later moves keys to different partitions.
+
+```
+partitions = max( target throughput / throughput one producer can push into a partition,
+                  target throughput / throughput one consumer can process from a partition )
+```
+
+Example: you need 200 MB/s. One partition takes about 10 MB/s from producers, but one consumer instance processes only 5 MB/s.
+
+```
+max(200 / 10, 200 / 5) = max(20, 40) = 40 partitions, then add room for growth → 48 or 60
+```
+
+Measure both rates for your own records with `kafka-producer-perf-test.sh` and `kafka-consumer-perf-test.sh`. Numbers vary enormously with record size and processing cost.
+
+### Why not 10,000 partitions?
+
+| Cost | Why |
+|---|---|
+| Producer memory and batching | Batches are per partition. Spread over many partitions, each batch is smaller, so compression and throughput drop. |
+| Open files and memory on brokers | Every partition replica has segment, index, and time-index files. |
+| End-to-end latency | A follower replicates many partitions through a few fetcher threads (`num.replica.fetchers`, default 1). |
+| Rebalances and failover | More partitions to move and more leaders to elect when a broker fails. |
+
+KRaft raised the practical limit a lot, but a few thousand partitions per broker is still a sensible ceiling for most hardware.
+
+### Sizing disk and network
+
+```
+total disk   = ingress × retention × replication factor ÷ 0.7     (keep 30% free)
+broker in    = (ingress + ingress × (RF − 1)) ÷ brokers           (producers + replication)
+broker out   = (ingress × consumer groups + ingress × (RF − 1)) ÷ brokers
+```
+
+Example: 50 MB/s ingress, 7 days retention, RF 3, 3 consumer groups, 6 brokers.
+
+```
+total disk = 50 MB/s × 604,800 s × 3 ÷ 0.7 ≈ 130 TB  →  ~21.6 TB per broker
+broker in  = (50 + 100) ÷ 6 = 25 MB/s
+broker out = (150 + 100) ÷ 6 ≈ 42 MB/s
+```
+
+Each consumer group reads the data once more, so egress grows with every new group. Fetch-from-follower (`client.rack`) does not reduce total egress, but it keeps it inside one availability zone, which matters for cloud bills.
+
+### Topic conventions
+
+- **Name topics by domain and event**, for example `payments.card-authorized.v1`. Avoid names that describe the consumer, because topics outlive the services that read them.
+- **One event type per topic** is simplest. Several types in one topic is right when you need their *relative order*, for example all events of one account, which must share a key and a partition.
+- **Disable automatic topic creation** in production (`auto.create.topics.enable=false`) and create topics on purpose, with explicit partitions, RF, and retention.
+- **Always set `replication.factor=3` and `min.insync.replicas=2`** for data you cannot lose.
+
+## 24. Keys, schemas, and message size
+
+### Choosing keys
+
+The key decides three things: the partition, the order, and which records compaction keeps.
+
+| Goal | Key |
+|---|---|
+| Order all events of one entity | The entity id (`order-id`, `account-id`) |
+| Join two topics | The same key, with the same partition count and partitioner in both |
+| A compacted "latest value" table | The entity id. The value is the full current state. |
+| Spread load evenly, no ordering needed | `null` (the sticky partitioner spreads batches) |
+
+A key with very uneven traffic creates a **hot partition** that only one consumer can read. If one customer is 30% of traffic, that partition limits the whole group.
+
+### Schemas and evolution
+
+Kafka stores bytes. It does not know or check your format. Producers and consumers must agree on it, and that agreement changes over time.
+
+- **Use a schema format with evolution rules:** Avro, Protobuf, or JSON Schema. Plain JSON without a schema works until someone renames a field.
+- A **schema registry** (Confluent Schema Registry, Apicurio, Karapace) stores schemas and gives each one an id. The producer puts the id in the first bytes of the value; the consumer looks the schema up.
+- **Compatibility modes** decide which changes are allowed:
+
+| Mode | Allowed change | Upgrade order |
+|---|---|---|
+| Backward | New schema can read old data (e.g. add an optional field, delete a field) | Upgrade consumers first |
+| Forward | Old schema can read new data (e.g. add a field, delete an optional field) | Upgrade producers first |
+| Full | Both | Either order |
+
+- For a change that breaks compatibility, create a **new topic** (`...v2`), write to both for a while, and move consumers over.
+
+### Message size
+
+| Setting | Default | Where |
+|---|---|---|
+| `message.max.bytes` (`max.message.bytes` per topic) | ~1 MB | Broker / topic: largest batch accepted |
+| `max.request.size` | 1 MB | Producer: largest request |
+| `max.partition.fetch.bytes` | 1 MB | Consumer: per partition per fetch (a larger batch is still returned so the consumer is never stuck) |
+| `fetch.max.bytes` | 50 MB | Consumer: per fetch response |
+
+Kafka works best with records from a few hundred bytes to a few hundred KB. For large payloads (files, images), use the **claim check** pattern: store the payload in object storage and send a small record with its location.
+
+## 25. Reliability patterns
+
+### Idempotent consumers
+
+At-least-once delivery means **any record can be processed twice**: after a crash, a rebalance, or a failed commit. Design processing so a second run does no harm:
+
+- Upsert by a natural key instead of inserting.
+- Store the processed `(topic, partition, offset)` or an event id together with the result, in the same database transaction, and skip duplicates.
+- Make external calls idempotent (for example, with idempotency keys on payment APIs).
+
+### The transactional outbox
+
+A service often needs to update its database *and* publish an event. Doing both directly cannot be atomic: the database commit can succeed while the produce fails, or the other way round.
+
+```mermaid
+flowchart LR
+    S["Service"] -- "one DB transaction:<br/>update orders + insert into outbox" --> DB[("Database")]
+    DB -- "change data capture<br/>(e.g. Debezium on Kafka Connect)" --> K["Kafka topic"]
+    K --> C["Consumers"]
+```
+
+The service writes the event to an `outbox` table in the same transaction as the business change. A CDC connector reads the database log and publishes the outbox rows. Either both happen or neither does.
+
+### Errors: retry, dead-letter, or stop
+
+When processing a record fails, you have three options:
+
+```mermaid
+flowchart TD
+    R["Record fails"] --> T{"Transient?<br/>(timeout, 503, lock)"}
+    T -- yes --> Retry["Retry in place with backoff<br/>(blocks this partition meanwhile)"]
+    Retry -- "still failing after N tries" --> D
+    T -- "no (bad data, bug)" --> D{"Dead-letter topic configured?"}
+    D -- yes --> DLQ["Send original bytes + error headers<br/>to the DLT, commit, continue"]
+    D -- no --> Stop["Stop the consumer<br/>(never skip silently)"]
+```
+
+- **Poison pills** are records that can never be processed, for example because they cannot be deserialized. Without a dead-letter topic they block their partition forever.
+- **Keep the original bytes** in the dead-letter record, plus headers with the source topic, partition, offset, and error. Then records can be inspected and replayed.
+- **Retrying in place blocks the partition**, which preserves order but stops progress. **Retry topics** (`orders.retry.1m`, `orders.retry.10m`) let the main partition continue, but they give up ordering for retried records.
+
+This project's `EventConsumer` implements the first two branches: per-record retries with `RetryPolicy`, then a dead-letter topic with `dlq.*` headers, or stopping when no dead-letter topic is configured.
+
+## 26. Kafka Streams
+
+Kafka Streams is a Java library (not a cluster) for processing data from Kafka topics into Kafka topics. Your application *is* the stream processor; scaling it means running more instances with the same `application.id`.
+
+```mermaid
+flowchart LR
+    In["orders topic"] --> F["filter / map<br/>(stateless)"]
+    F --> G["groupByKey + count<br/>(stateful)"]
+    G <--> SS[("state store<br/>RocksDB on local disk")]
+    SS -. "every update" .-> CL["changelog topic<br/>(compacted)"]
+    G --> Out["order-counts topic"]
+```
+
+Core ideas:
+
+| Concept | Meaning |
+|---|---|
+| `KStream` | An event stream: every record is a new fact |
+| `KTable` | A changelog: each record is the latest value for its key |
+| `GlobalKTable` | A table fully copied to every instance (for small lookup data) |
+| Task | The unit of parallelism: one task per input partition (per sub-topology) |
+| State store | Local RocksDB (or in-memory) store for aggregations and joins |
+| Changelog topic | Compacted topic backing each store, used to rebuild it after a failure or move |
+| Repartition topic | Internal topic created when you change the key before a stateful step |
+| Standby replica | A warm copy of a store on another instance (`num.standby.replicas`) for fast failover |
+
+Things to know:
+
+- **Joins need co-partitioning:** both inputs must have the same key and the same number of partitions. Otherwise Streams has to repartition, which costs an extra topic and network round trip.
+- **Windows:** tumbling (fixed, non-overlapping), hopping (fixed, overlapping), sliding, and session (gaps of inactivity). A **grace period** decides how long late records are still accepted.
+- **Exactly-once:** `processing.guarantee=exactly_once_v2` wraps "read, update state, write output, commit offsets" in one Kafka transaction.
+- **Rebalancing:** Streams groups (KIP-1071, `kafka-streams-groups.sh`) move task assignment to the broker, like KIP-848 does for consumers.
+- **Internal topics** are named `<application.id>-<name>-changelog` and `-repartition`. Reset an application with `kafka-streams-application-reset.sh`.
+
+## 27. Kafka Connect
+
+Kafka Connect moves data between Kafka and other systems (databases, S3, Elasticsearch...) without writing code. You configure **connectors**; Connect runs them.
+
+```mermaid
+flowchart LR
+    DB[("PostgreSQL")] --> SC
+    subgraph Workers["Connect cluster (distributed mode)"]
+        SC["Source connector<br/>tasks 1..N"] --> CV1["converter<br/>(Avro, JSON, ...)"]
+        SMT1["SMTs<br/>single message transforms"]
+        CV1 --> SMT1
+        SK["Sink connector<br/>tasks 1..N"]
+    end
+    SMT1 --> K["Kafka topics"]
+    K --> SK
+    SK --> S3[("S3 / warehouse")]
+    Workers <-. "config, offsets, status" .-> IT[("internal topics<br/>connect-configs, connect-offsets, connect-status")]
+```
+
+| Concept | Meaning |
+|---|---|
+| Worker | A JVM running Connect. Workers with the same `group.id` form a cluster and share the work. |
+| Connector | A configured integration (e.g. "this database into these topics"). Splits work into tasks. |
+| Task | The unit that actually copies data. Tasks are spread across workers. |
+| Converter | Turns Connect's internal data into bytes and back (`key.converter`, `value.converter`). |
+| SMT | A small per-record change: rename a field, route to another topic, add a timestamp. |
+| Internal topics | `config.storage.topic`, `offset.storage.topic`, `status.storage.topic`. Connect's own state, stored in Kafka. |
+
+- Manage connectors through the REST API (port 8083 by default): `POST /connectors`, `GET /connectors/<name>/status`, `PUT /connectors/<name>/pause`.
+- **Error handling for sinks:** `errors.tolerance=all` with `errors.deadletterqueue.topic.name` sends bad records to a dead-letter topic instead of failing the task.
+- **Exactly-once source connectors** (KIP-618) are available when the connector supports them (`exactly.once.source.support=enabled` on workers).
+- Connect has its own REST security model; see `docs/security/security-model-connect.md`.
+
+## 28. Multiple clusters and disaster recovery
+
+### Options
+
+| Approach | How | Data loss on regional failure (RPO) | Notes |
+|---|---|---|---|
+| Stretch cluster | One cluster across 3 availability zones, `broker.rack` set, RF 3, `min.insync.replicas=2` | 0 | Synchronous. Needs low latency between zones. Survives one zone, not one region. |
+| MirrorMaker 2, active/passive | Replicate topics from primary to a standby cluster | Seconds (asynchronous) | Fail over by moving clients to the standby. |
+| MirrorMaker 2, active/active | Each region produces locally, and topics are mirrored both ways | Seconds | Consumers read local + mirrored topics. Needs care with duplicates and ordering. |
+
+### MirrorMaker 2
+
+MirrorMaker 2 runs on Kafka Connect with three connectors:
+
+- **MirrorSourceConnector** copies topic data and topic configs.
+- **MirrorCheckpointConnector** translates consumer group offsets, so a group can continue in the other cluster near where it stopped.
+- **MirrorHeartbeatConnector** emits heartbeats to measure replication health and latency.
+
+By default, remote topics get the source cluster's alias as a prefix: `orders` from cluster `primary` becomes `primary.orders` (`DefaultReplicationPolicy`). This prevents replication loops in active/active setups. `IdentityReplicationPolicy` keeps the same name for simple active/passive setups.
+
+Offsets differ between clusters (the same record has a different offset in each). That is why offset translation through checkpoints is needed. Plan for some reprocessing after a failover.
+
+---
+
+# Part 8: Running Kafka
+
+## 29. Performance tuning
+
+### Producer
+
+| Goal | Settings |
+|---|---|
+| Throughput | `linger.ms` 10–100, `batch.size` 64–256 KB, `compression.type=lz4` or `zstd`, enough `buffer.memory` |
+| Latency | `linger.ms` 0–5, smaller batches, `acks=1` only if you accept the loss risk |
+| Durability | `acks=all`, `enable.idempotence=true`, topic `min.insync.replicas=2` |
+
+Watch `record-error-rate`, `request-latency-avg`, `batch-size-avg`, `records-per-request-avg`, and `buffer-available-bytes` in the producer's metrics. This project's `ProducerOptions` defaults to `linger.ms=10`, 64 KB batches, and LZ4, a throughput-friendly starting point.
+
+### Consumer
+
+| Goal | Settings |
+|---|---|
+| Throughput | Raise `fetch.min.bytes` (e.g. 64 KB–1 MB) with `fetch.max.wait.ms` 100–500, `max.partition.fetch.bytes` if records are large |
+| Latency | `fetch.min.bytes=1` (the default) |
+| Slow processing | Lower `max.poll.records`, or process in parallel per partition |
+
+Watch `records-lag-max`, `time-between-poll-avg`, `last-poll-seconds-ago`, `commit-latency-avg`, and `rebalance-latency-avg`.
+
+### Broker and OS
+
+- **Threads:** raise `num.io.threads` if `RequestHandlerAvgIdlePercent` drops below about 30%, and `num.network.threads` if `NetworkProcessorAvgIdlePercent` does. Raise `num.replica.fetchers` if followers lag.
+- **JVM:** G1 GC with a 6–8 GB heap. A bigger heap does not help; the page cache does.
+- **Linux:** XFS or ext4 with `noatime`, `vm.swappiness=1`, a high file-descriptor limit (100,000+), and a high `vm.max_map_count` (each segment index is memory-mapped).
+- **Disks:** several disks in `log.dirs` (JBOD) or RAID 10. Keep the KRaft metadata log on fast storage.
+- **Measure, then change one thing at a time** with `kafka-producer-perf-test.sh`, `kafka-consumer-perf-test.sh`, and `kafka-e2e-latency.sh`.
+
+## 30. Operations runbook
+
+### Upgrading a cluster
+
+```mermaid
+flowchart LR
+    A["Read the upgrade notes<br/>docs/getting-started/upgrade.md"] --> B["Rolling restart:<br/>controllers first, then brokers,<br/>on the new binaries"]
+    B --> C["Verify health<br/>(no under-replicated partitions)"]
+    C --> D["Finalize the new features:<br/>kafka-features.sh upgrade --release-version X"]
+```
+
+Until the last step, the cluster keeps the old `metadata.version`, so you can still roll back the binaries. After finalizing, new features are enabled and downgrade may not be possible.
+
+```bash
+bin/kafka-features.sh --bootstrap-server localhost:9092 describe
+bin/kafka-features.sh --bootstrap-server localhost:9092 upgrade --release-version 4.4 --dry-run
+```
+
+Restart one node at a time, and wait until `UnderReplicatedPartitions` is 0 before the next.
+
+### Moving partitions
+
+**Adding a broker does not move any data to it.** Only new partitions land there. To use it, reassign existing partitions:
+
+```bash
+# 1. propose a plan for some topics across brokers 1-4
+bin/kafka-reassign-partitions.sh --bootstrap-server localhost:9092 \
+  --topics-to-move-json-file topics.json --broker-list 1,2,3,4 --generate
+
+# 2. run it, throttled so replication does not starve clients (bytes/s)
+bin/kafka-reassign-partitions.sh --bootstrap-server localhost:9092 \
+  --reassignment-json-file plan.json --execute --throttle 50000000
+
+# 3. check progress; --verify also removes the throttle when done
+bin/kafka-reassign-partitions.sh --bootstrap-server localhost:9092 \
+  --reassignment-json-file plan.json --verify
+```
+
+For large clusters, tools such as Cruise Control generate and run balanced plans automatically.
+
+### Removing a broker
+
+1. Reassign all its partitions to other brokers.
+2. Shut it down cleanly.
+3. Remove its registration: `bin/kafka-cluster.sh unregister --bootstrap-server ... --id <broker-id>`.
+
+### Leadership balance
+
+The first replica in each partition's list is the **preferred leader**. After restarts, leadership can pile up on a few brokers. With `auto.leader.rebalance.enable=true` (the default) the controller moves it back periodically. To do it by hand:
+
+```bash
+bin/kafka-leader-election.sh --bootstrap-server localhost:9092 --election-type preferred --all-topic-partitions
+```
+
+### Other useful tools
+
+| Tool | Use |
+|---|---|
+| `kafka-log-dirs.sh --describe` | Disk usage per partition and log directory |
+| `kafka-get-offsets.sh` | Earliest and latest offsets per partition, or offsets for a timestamp |
+| `kafka-delete-records.sh` | Delete everything before an offset (moves the log start offset) |
+| `kafka-transactions.sh` | List transactions, find and abort hanging ones |
+| `kafka-dump-log.sh` | Decode segment, index, or metadata log files |
+| `kafka-metadata-quorum.sh` | KRaft leader and replication lag |
+| `kafka-configs.sh` | Read and change dynamic configs for topics, brokers, users, clients |
+
+## 31. Monitoring: the metrics that matter
+
+### Cluster health (alert on these)
+
+| Metric | Healthy value | Meaning when not |
+|---|---|---|
+| `kafka.controller:ActiveControllerCount` | Sum across controllers = 1 | 0: no active controller. More than 1: serious problem. |
+| `kafka.controller:OfflinePartitionsCount` | 0 | Partitions with no leader: no reads or writes possible |
+| `kafka.server:UnderReplicatedPartitions` | 0 | Followers behind: a broker is slow or down |
+| `kafka.server:UnderMinIsrPartitionCount` | 0 | `acks=all` writes to these partitions are failing |
+| `kafka.server:AtMinIsrPartitionCount` | 0 | One more failure and writes start failing |
+| `kafka.controller:FencedBrokerCount` | 0 | A broker stopped heartbeating |
+| `kafka.controller:UncleanLeaderElectionsPerSec` | 0 | Data was probably lost |
+
+### Capacity and performance
+
+| Metric | What to watch |
+|---|---|
+| `RequestHandlerAvgIdlePercent`, `NetworkProcessorAvgIdlePercent` | Below ~30%: the broker is running out of threads |
+| `RequestMetrics` (`TotalTimeMs` and its parts, section 21) | Produce and fetch latency, and where the time goes |
+| `BytesInPerSec`, `BytesOutPerSec`, `MessagesInPerSec` | Load per broker and per topic |
+| `IsrShrinksPerSec`, `IsrExpandsPerSec` | Frequent flapping means overloaded brokers or network problems |
+| `PartitionCount`, `LeaderCount` per broker | Imbalance |
+| Disk usage per log directory | Alert well before full: a full disk takes the broker offline |
+| Consumer lag (`records-lag-max` or `kafka-consumer-groups.sh`) | The most important application-level signal |
+
+### KRaft
+
+| Metric | Meaning |
+|---|---|
+| `current-state` (raft metrics) | Leader, follower, candidate... for each controller |
+| `LastAppliedRecordOffset`, `LastAppliedRecordLagMs` | How far behind each node's metadata is |
+| `EventQueueTimeMs` | How long requests wait in the controller's single-threaded queue |
+| `ActiveBrokerCount`, `FencedBrokerCount` | Broker registrations |
+
+## 32. Troubleshooting playbook
+
+| Symptom | Likely causes | What to check and do |
+|---|---|---|
+| Consumer lag keeps growing | Processing too slow, too few partitions or consumers, hot partition, rebalance loop | Per-partition lag (`--describe`): one partition or all? Processing time per record. `rebalance-latency` and rebalance count. |
+| Constant rebalances | `max.poll.interval.ms` exceeded, session timeouts from GC pauses, frequent deploys | Consumer logs for "leaving group", `time-between-poll-avg`. Use static membership, smaller `max.poll.records`, the new consumer protocol. |
+| `NotEnoughReplicasException` on produce | ISR smaller than `min.insync.replicas` | `UnderMinIsrPartitionCount`. Which follower is out of sync and why (disk, network, GC)? |
+| `TimeoutException` / `delivery.timeout.ms` expired | Broker unreachable, leader unavailable, ISR too small, producer buffer full | Producer `record-error-rate`, broker availability, `OfflinePartitionsCount` |
+| Produce latency spikes | Follower replication slow (`RemoteTimeMs`), disk saturation (`LocalTimeMs`), thread exhaustion (`RequestQueueTimeMs`) | Request latency breakdown (section 21) |
+| `RecordTooLargeException` | Batch larger than `max.request.size` or `max.message.bytes` | Raise limits consistently, or use the claim check pattern |
+| `CommitFailedException` | Member was removed from the group before committing | Processing exceeded `max.poll.interval.ms`. Commit more often or process faster. |
+| Consumer stuck at one offset | Poison pill, deserialization error | Logs. Add a dead-letter topic or skip with `kafka-consumer-groups.sh --reset-offsets --shift-by 1` (deliberately). |
+| `read_committed` consumers stuck | A hanging (never-finished) transaction blocks the last stable offset | `kafka-transactions.sh find-hanging`, then `abort` |
+| Broker slow to start | Log recovery after an unclean shutdown | Logs show recovery progress. Raise `num.recovery.threads.per.data.dir`. |
+| Disk full | Retention too long for the traffic, uneven partition placement, tiered storage uploads failing. (Never a slow consumer: Kafka deletes by retention, not by consumption.) | `kafka-log-dirs.sh`, retention configs, `RemoteCopyErrorsPerSec` |
+
+## 33. Testing Kafka applications
+
+| Level | Tool | Good for |
+|---|---|---|
+| Unit | `MockProducer`, `MockConsumer` from `kafka-clients` | Logic around the client without a broker |
+| Unit (Streams) | `TopologyTestDriver` from `kafka-streams-test-utils` | Kafka Streams topologies, with simulated time |
+| Integration | In-JVM KRaft cluster (`kafka-test-common-runtime`) | Real broker behaviour, no Docker |
+| Integration | Testcontainers (`apache/kafka` image) | Real broker in a container, closer to production |
+| System | `kafka-verifiable-producer.sh` / `-consumer.sh`, Trogdor | Fault injection and load, as Kafka's own system tests do |
+
+This project uses the in-JVM KRaft cluster (see `project/Dependencies.scala` and `src/test/scala/kafkainpractice/client/KafkaClientsIntegrationSpec.scala`), with `Test / fork := true` so the broker gets its own JVM.
+
+Test the failure cases, not only the happy path:
+
+- A record that cannot be deserialized: does it go to the dead-letter topic?
+- A handler that fails a few times and then succeeds: is it retried, and processed only once?
+- A consumer stopped in the middle of a batch: does the next one continue from the last commit without losing records?
+- Two consumers in one group: do they split the partitions, and does one take over when the other stops?
+
+## 34. Anti-patterns
+
+| Anti-pattern | Why it hurts | Instead |
+|---|---|---|
+| Using Kafka as a database with lookups by key | Kafka has no index by key. Finding a record means scanning. | Materialize a compacted topic into a store (Kafka Streams, a database) |
+| One topic per user or per entity | Millions of partitions | One topic, keyed by user |
+| `acks=1` or RF 2 for important data | One failure can lose acknowledged data | `acks=all`, RF 3, `min.insync.replicas=2` |
+| Huge messages (10 MB+) | Memory pressure, slow replication, fetch problems | Claim check pattern |
+| Synchronous `send().get()` per record | One round trip per record, very low throughput | Asynchronous sends with callbacks, or batch-level waiting |
+| Committing before processing | Records lost on a crash | Commit after processing |
+| Ignoring consumer lag | Problems are found by users, not by alerts | Alert on lag and its growth rate |
+| Auto topic creation in production | Topics with default partitions, RF, and retention appear from typos | `auto.create.topics.enable=false` |
+| Sharing one `group.id` across different applications | They split the data between them | One group id per application |
+| Long-running processing inside `poll()` loop without limits | Member removed from the group, rebalance loops | Bound the work per poll, or decouple polling from processing (as fs2-kafka does) |
+
+## 35. Self-test
+
+If you can answer these without looking, you understand Kafka well. Click to reveal the answers.
+
+<details><summary>1. A producer uses <code>acks=all</code> on a topic with RF 3 and <code>min.insync.replicas=2</code>. Two brokers die. What happens to writes and reads?</summary>
+
+Writes to partitions whose ISR is now 1 fail with `NotEnoughReplicas`, because the ISR is below 2. Reads still work from the remaining leader (if it was in the ISR). The cluster chooses availability for reads and consistency for writes.
+</details>
+
+<details><summary>2. Why can a consumer never read a record that is later lost in a leader failover?</summary>
+
+Consumers read only below the high watermark, and records below the high watermark are on every in-sync replica. A new leader is elected from the ISR, so it has all those records. Only records above the high watermark can be truncated.
+</details>
+
+<details><summary>3. A group has 12 consumers on a 10-partition topic. Lag is growing. Will adding 4 more consumers help?</summary>
+
+No. Only 10 consumers can be active; 2 are already idle. Add partitions (understanding that keys will move), speed up processing, or process records within one partition in parallel where order allows.
+</details>
+
+<details><summary>4. What exactly does idempotence protect against, and what does it not?</summary>
+
+It removes duplicates caused by producer retries within one producer session, per partition, using producer id + sequence numbers. It does not protect against an application that sends the same event twice, against duplicates after the producer restarts with a new id, or against duplicate processing on the consumer side.
+</details>
+
+<details><summary>4b. Then what makes "exactly once" possible?</summary>
+
+Transactions: the consumer's offset commit and the producer's output writes are committed atomically in one transaction, and downstream consumers use `read_committed`. A restarted instance with the same `transactional.id` fences the old one.
+</details>
+
+<details><summary>5. Produce p99 latency jumped from 20 ms to 300 ms. RemoteTimeMs is high, LocalTimeMs is normal. Where do you look?</summary>
+
+At the followers: the leader is waiting for replication. Check follower brokers' disks, GC, network, and `num.replica.fetchers`, and look for ISR shrinks.
+</details>
+
+<details><summary>6. Why does Kafka not fsync every write, and why is that still safe?</summary>
+
+fsync per write would destroy throughput. Durability comes from replication: an acknowledged `acks=all` write is in memory on every ISR replica, usually in different racks or zones. Losing it requires all of them to fail before the OS flushes.
+</details>
+
+<details><summary>7. How does a consumer find its group coordinator, and what happens to the group if that broker dies?</summary>
+
+`abs(hash(group.id)) % 50` picks a partition of `__consumer_offsets`. The leader of that partition is the coordinator. If it dies, a follower of that partition becomes leader, replays the partition to rebuild group state, and becomes the new coordinator. Clients rediscover it with `FindCoordinator`.
+</details>
+
+<details><summary>8. What does the KRaft active controller do when a broker stops heartbeating?</summary>
+
+After `broker.session.timeout.ms` (9 s), it writes a `FenceBrokerRecord` and `PartitionChangeRecord`s that move leadership of that broker's partitions to other ISR members. Brokers apply those records from the metadata log, and clients get `NotLeaderOrFollower` and refresh metadata.
+</details>
+
+<details><summary>9. Why might offsets in a topic have gaps, so that offset 105 follows 103?</summary>
+
+Transaction control markers (commit or abort) take an offset but are never returned to consumers. Compaction also removes records, leaving gaps.
+</details>
+
+<details><summary>10. You add a new broker to a busy cluster. A week later it holds almost no data. Why?</summary>
+
+Kafka does not rebalance existing partitions automatically. Only new partitions are placed there. Use `kafka-reassign-partitions.sh` (with a throttle) or a tool like Cruise Control.
+</details>
+
+<details><summary>11. What is the difference between the classic and the KIP-848 rebalance protocol, in one sentence?</summary>
+
+In the classic protocol, a client leader computes the assignment after every member rejoins behind a global barrier; in KIP-848, the broker computes it and moves each member's partitions individually, with no global barrier.
+</details>
+
+<details><summary>12. When does a consumer start at the beginning of a topic?</summary>
+
+Only when its group has no committed offset for that partition (a new group, or offsets expired after `offsets.retention.minutes`), or the committed offset is out of range, and `auto.offset.reset=earliest`. Otherwise it continues from the committed offset. You can also seek explicitly.
+</details>
+
+## 36. Where to go next
+
+### A learning path
+
+1. **Run it.** Start a single KRaft node, create topics, produce and consume with the console tools. Use `kafka-dump-log.sh` on a segment to see batches.
+2. **Break it.** Run three brokers, kill one during a produce load with `acks=all`, and watch the ISR, `UnderReplicatedPartitions`, and leader changes.
+3. **Watch a rebalance.** Start two consumers in one group, kill one, and watch `kafka-consumer-groups.sh --describe --members` and the logs.
+4. **Read the protocol.** Pick `ProduceRequest.json`, `FetchRequest.json`, and `ConsumerGroupHeartbeatRequest.json` (copied into `src/main/resources/message/`) and follow each field into the code.
+5. **Measure.** Use the perf-test tools to find your own producer and consumer limits.
+6. **Build failure tests** in this project for the cases listed in section 33.
+
+### KIPs worth reading
+
+KIPs (Kafka Improvement Proposals) explain *why* each feature works the way it does. Search for them at `cwiki.apache.org/confluence/display/KAFKA`.
+
+| KIP | Topic |
+|---|---|
+| KIP-98 | Exactly-once: idempotence and transactions |
+| KIP-101 | Leader epochs for safe truncation |
+| KIP-392 | Fetch from the closest replica |
+| KIP-405 | Tiered storage |
+| KIP-500 / KIP-595 / KIP-631 | Replacing ZooKeeper: KRaft, the Raft protocol, the controller |
+| KIP-848 | The new consumer rebalance protocol |
+| KIP-853 | Dynamic KRaft quorums |
+| KIP-890 | Transactions server-side defense |
+| KIP-932 | Share groups (queues) |
+| KIP-966 | Eligible leader replicas |
+| KIP-996 | Pre-vote in KRaft |
+| KIP-1071 | Streams groups |
