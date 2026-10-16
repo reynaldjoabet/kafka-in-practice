@@ -1,0 +1,87 @@
+name: Scala CI Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SBT_OPTS: -Xmx4g -XX:ReservedCodeCacheSize=512m
+
+jobs:
+  # Formatting is independent of Scala and JDK version, so it runs once here
+  # rather than being repeated in every matrix leg.
+  lint:
+    name: Formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: 'sbt'
+          cache-dependency-path: |
+            **/*.sbt
+            **/project/build.properties
+            **/project/*.scala
+            **/project/**/*.scala
+
+      - name: Set up sbt
+        uses: sbt/setup-sbt@v1
+
+      - name: Check formatting
+        run: sbt -v "scalafmtSbtCheck; scalafmtCheckAll"
+
+  build:
+    name: Java ${{ matrix.java }} (${{ matrix.distribution }})
+
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ['21', '25']
+
+        distribution: [temurin, corretto]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Java ${{ matrix.java }} (${{ matrix.distribution }})
+        uses: actions/setup-java@v6
+        with:
+          distribution: ${{ matrix.distribution }}
+          java-version: ${{ matrix.java }}
+          cache: 'sbt'
+          check-latest: false
+          cache-dependency-path: |
+            **/*.sbt
+            **/project/build.properties
+            **/project/*.scala
+            **/project/**/*.scala
+
+      - name: Set up sbt
+        uses: sbt/setup-sbt@v1
+
+      - name: Compile and test
+        run: sbt -v "Test/compile; test"
