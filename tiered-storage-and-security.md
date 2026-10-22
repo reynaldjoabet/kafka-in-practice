@@ -118,7 +118,7 @@ Interface: `storage/api/src/main/java/org/apache/kafka/server/log/remote/storage
 | `PRODUCER_SNAPSHOT` | `.snapshot` | Rebuild idempotent/transactional producer state |
 | `LEADER_EPOCH` | leader-epoch checkpoint | Rebuild epoch history for truncation decisions |
 
-**Kafka ships no production RSM.** You use one from a vendor or the community (for example Aiven's or Confluent-compatible open-source S3/GCS/Azure plugins). The test implementation `LocalTieredStorage` (in `storage/src/test/...`) writes to a local directory and is good for learning.
+**Kafka ships no production RSM.** You use one from a vendor or the community (for example Aiven's or Confluent-compatible open-source S3/GCS/Azure plugins). The test implementation `LocalTieredStorage` (in `storage/src/testFixtures/...`) writes to a local directory and is good for learning.
 
 ### RemoteLogMetadataManager (RLMM): the metadata
 
@@ -179,7 +179,32 @@ sequenceDiagram
     Note over T: the local copy may now be deleted<br/>once local retention allows
 ```
 
-Upload speed can be capped with `remote.log.manager.copy.max.bytes.per.second` so uploads do not saturate the network. Two newer settings, `log.remote.copy.lag.ms` and `log.remote.copy.lag.bytes`, let segments wait a while before upload.
+Upload speed can be capped with `remote.log.manager.copy.max.bytes.per.second` so uploads do not saturate the network. Failed tasks retry with exponential backoff from `remote.log.manager.task.retry.backoff.ms` (500 ms) up to `remote.log.manager.task.retry.backoff.max.ms` (30 s), with 20% jitter.
+
+**Delaying uploads on purpose.** By default a closed segment is uploaded as soon as the next copy task runs (`log.remote.copy.lag.ms=0`). Two broker settings, with topic-level overrides `remote.copy.lag.ms` and `remote.copy.lag.bytes`, let a segment stay local-only for a while. A segment is eligible when **either** check passes:
+
+| Setting | Default | Segment becomes eligible when… |
+|---|---|---|
+| `log.remote.copy.lag.ms` | `0` (upload at once) | its newest record is at least this old. `-1` derives the value from the effective local retention time. |
+| `log.remote.copy.lag.bytes` | `-1` (derived from local retention size) | at least this many bytes of newer data sit after it in the local log |
+
+Why delay? Data that is read heavily for a short time after it is written (replays, late consumers) is then served from local disk, and short-lived topics may expire before ever paying for remote PUT requests. The value should not exceed local retention, or data would have to stay local longer than local retention allows.
+
+### The life of one segment
+
+```
+time ───────────────────────────────────────────────────────────────────────────────────────►
+      active          rolled          below LSO, copy-lag    copied               local retention   total retention
+      (local only)    (segment.ms /   satisfied              (COPY_SEGMENT_       passed            passed
+                       segment.bytes)                         FINISHED)
+  ────┬───────────────┬───────────────┬──────────────────────┬────────────────────┬─────────────────┬──────────►
+      │ written to    │ immutable,    │ RLMCopyTask uploads  │ on both tiers,     │ deleted locally │ RLMExpirationTask
+      │ page cache    │ still local   │ it (leader only)     │ reads served       │ (followers too, │ deletes it remotely
+      │               │               │                      │ locally            │ via RLMFollower │ (DELETE_SEGMENT_*)
+      │               │               │                      │                    │ Task)           │
+  local tier: ███████████████████████████████████████████████████████████████████████
+  remote tier:                                               █████████████████████████████████████████████
+```
 
 ## 5. Retention: local vs total
 
@@ -251,6 +276,8 @@ Details worth knowing:
 
 This is done by `TierStateMachine` (`core/src/main/java/kafka/server/TierStateMachine.java`). It is why replacing a broker is fast with tiered storage: a new replica copies only hours of local data, not weeks.
 
+Since Kafka 4.3 (KIP-1023) a new follower can skip even more. With the dynamic broker config `follower.fetch.last.tiered.offset.enable=true` (default `false`), a follower with no local data starts at the leader's **earliest pending upload offset** instead of its local log start offset, so it does not fetch segments that are on local disk but already uploaded. `ListOffsets` can return that offset too (timestamp type `EARLIEST_PENDING_UPLOAD_TIMESTAMP`, -6).
+
 **On leader change,** the new leader reads `__remote_log_metadata` to learn the highest copied offset and continues uploading from there. Leader epochs in the segment metadata make sure that segments from a log lineage that was truncated away are never served.
 
 ## 8. Configuration reference
@@ -267,12 +294,16 @@ This is done by `TierStateMachine` (`core/src/main/java/kafka/server/TierStateMa
 | `remote.log.metadata.manager.impl.prefix` | `rlmm.config.` | Configs with this prefix are passed to the RLMM |
 | `remote.log.metadata.manager.listener.name` | none | Listener the default RLMM's internal clients use. **Required** with the default RLMM. |
 | `remote.log.manager.task.interval.ms` | 30000 | How often copy/expire tasks run |
+| `remote.log.manager.task.retry.backoff.ms` / `.max.ms` | 500 / 30000 | Backoff after a failed task (with 20% jitter) |
+| `log.remote.copy.lag.ms` / `.bytes` | 0 / -1 | Keep closed segments local-only for a while before uploading (section 4) |
 | `remote.log.manager.copier.thread.pool.size` | 10 | Upload threads |
 | `remote.log.manager.expiration.thread.pool.size` | 10 | Remote deletion threads |
 | `remote.log.manager.follower.thread.pool.size` | 2 | Follower tracking threads |
 | `remote.log.reader.threads` | 10 | Remote read threads |
 | `remote.log.reader.max.pending.tasks` | 100 | Remote read queue size |
 | `remote.log.index.file.cache.total.size.bytes` | 1 GiB | Local cache for remote indexes |
+| `remote.log.index.file.cache.ttl.ms` | 900000 | Cached remote indexes unused this long are evicted |
+| `remote.log.metadata.custom.metadata.max.bytes` | 128 | Largest custom metadata an RSM may return per segment |
 | `remote.log.manager.copy.max.bytes.per.second` | unlimited | Upload throttle |
 | `remote.log.manager.fetch.max.bytes.per.second` | unlimited | Remote read throttle |
 | `remote.fetch.max.wait.ms` | 500 | Max time a remote fetch is parked |
@@ -294,6 +325,7 @@ RLMM topic settings (set via the `rlmm.config.` prefix):
 | `remote.storage.enable` | `false` | Turn tiering on for this topic |
 | `local.retention.ms` / `local.retention.bytes` | -2 | Local tier budget |
 | `retention.ms` / `retention.bytes` | 7 days / -1 | Total budget |
+| `remote.copy.lag.ms` / `remote.copy.lag.bytes` | broker value | Keep closed segments local-only for a while (section 4) |
 | `remote.log.copy.disable` | `false` | Stop uploading; remote data becomes read-only |
 | `remote.log.delete.on.disable` | `false` | Delete remote data when tiering is turned off |
 | `segment.bytes` / `segment.ms` | 1 GiB / 7 days | Segment size and age. Only closed segments upload, so these control how soon data can tier. |
@@ -302,11 +334,17 @@ RLMM topic settings (set via the `rlmm.config.` prefix):
 
 This uses the test `LocalTieredStorage` plugin to simulate a remote store with a local directory.
 
-**1. Build the test jar that contains the plugin:**
+**1. Get the jar that contains the plugin.** `LocalTieredStorage` now lives in the storage module's **test fixtures**, not its tests, so the `-test.jar` that older guides (including `docs/operations/tiered-storage.md`) mention no longer contains it. Either download the published one:
 
 ```bash
-./gradlew :storage:testJar
-# produces storage/build/libs/kafka-storage-<version>-test.jar
+curl -O https://repo1.maven.org/maven2/org/apache/kafka/kafka-storage/4.4.0/kafka-storage-4.4.0-test-fixtures.jar
+```
+
+or build it from a source tree:
+
+```bash
+./gradlew :storage:testFixturesJar
+# produces storage/build/libs/kafka-storage-<version>-test-fixtures.jar
 ```
 
 **2. Add to the broker's `server.properties`:**
@@ -316,7 +354,8 @@ remote.log.storage.system.enable=true
 remote.log.metadata.manager.listener.name=PLAINTEXT
 
 remote.log.storage.manager.class.name=org.apache.kafka.server.log.remote.storage.LocalTieredStorage
-remote.log.storage.manager.class.path=/path/to/kafka-storage-<version>-test.jar
+remote.log.storage.manager.class.path=/path/to/kafka-storage-<version>-test-fixtures.jar
+# required here: without it the plugin needs test helpers from another jar to make a temp dir
 rsm.config.dir=/tmp/kafka-remote-storage
 
 # single-broker test cluster only
@@ -397,20 +436,20 @@ A broker refuses to start with `remote.log.storage.system.enable=false` while ti
 
 ## 12. Monitoring
 
-Remote-storage metrics are defined in `storage/api/.../RemoteStorageMetrics.java` and exposed under `kafka.server:type=BrokerTopicMetrics` (per topic and for all topics). Watch these:
+Remote-storage metrics are defined in `storage/api/.../RemoteStorageMetrics.java`. Most are under `kafka.server:type=BrokerTopicMetrics` (per topic and for all topics); the thread-pool and retention metrics are under `kafka.log.remote`, as the MBean column shows. Watch these:
 
-| Metric | What to look for |
-|---|---|
-| `RemoteCopyBytesPerSec`, `RemoteCopyRequestsPerSec` | Upload throughput |
-| `RemoteCopyErrorsPerSec` | Any sustained value means local disk will start growing |
-| `RemoteCopyLagBytes`, `RemoteCopyLagSegments` | How much eligible data has not been uploaded yet |
-| `RemoteFetchBytesPerSec`, `RemoteFetchRequestsPerSec`, `RemoteFetchErrorsPerSec` | Remote read activity and failures |
-| `RemoteDeleteLagBytes`, `RemoteDeleteLagSegments`, `RemoteDeleteErrorsPerSec` | Remote retention keeping up |
-| `LocalRetentionSizeInPercent`, `RetentionSizeInPercent` | How full each retention budget is |
-| `RemoteLogManagerTasksAvgIdlePercent` | Copy/expiration thread pool saturation |
-| `RemoteLogSizeBytes`, `RemoteLogMetadataCount` | Total size and segment count in the remote tier |
-| `BuildRemoteLogAuxStateRequestsPerSec` | Followers bootstrapping from remote state |
-| `RemoteLogReaderTaskQueueSize`, `RemoteLogReaderAvgIdlePercent` | Remote read thread pool saturation |
+| Metric | MBean | What to look for |
+|---|---|---|
+| `RemoteCopyBytesPerSec`, `RemoteCopyRequestsPerSec` | `kafka.server:type=BrokerTopicMetrics` | Upload throughput |
+| `RemoteCopyErrorsPerSec` | `BrokerTopicMetrics` | Any sustained value means local disk will start growing |
+| `RemoteCopyLagBytes`, `RemoteCopyLagSegments` | `BrokerTopicMetrics` | How much eligible data has not been uploaded yet |
+| `RemoteFetchBytesPerSec`, `RemoteFetchRequestsPerSec`, `RemoteFetchErrorsPerSec` | `BrokerTopicMetrics` | Remote read activity and failures |
+| `RemoteDeleteLagBytes`, `RemoteDeleteLagSegments`, `RemoteDeleteErrorsPerSec` | `BrokerTopicMetrics` | Remote retention keeping up |
+| `LocalRetentionSizeInPercent`, `RetentionSizeInPercent` | `kafka.log.remote:type=RemoteLogManager` | How full each retention budget is |
+| `RemoteLogManagerTasksAvgIdlePercent` | `kafka.log.remote:type=RemoteLogManager` | Copy/expiration thread pool saturation |
+| `RemoteLogSizeBytes`, `RemoteLogMetadataCount` | `BrokerTopicMetrics` | Total size and segment count in the remote tier |
+| `BuildRemoteLogAuxStateRequestsPerSec` | `BrokerTopicMetrics` | Followers bootstrapping from remote state |
+| `RemoteLogReaderTaskQueueSize`, `RemoteLogReaderAvgIdlePercent` | `kafka.log.remote:type=RemoteStorageThreadPool` (the old `org.apache.kafka.storage.internals.log` group is deprecated since 4.2) | Remote read thread pool saturation |
 
 ---
 
@@ -663,7 +702,7 @@ sequenceDiagram
     Note over C: refreshes token before expiry,<br/>re-authenticates on the open connection
 ```
 
-The built-in default validator is the *unsecured* one, for testing only. In production configure the JWKS-based validator:
+The built-in default validator is the *unsecured* one, for testing only. In production configure the JWKS-based validator. Since Kafka 4.4 a broker with `sasl.oauthbearer.jwks.endpoint.url` set **refuses to start** unless both `sasl.oauthbearer.expected.audience` and `sasl.oauthbearer.expected.issuer` are set (or you deliberately opt out with `sasl.oauthbearer.allow.unverified.audience` / `.issuer`, both `false` by default):
 
 ```properties
 # broker
@@ -684,6 +723,17 @@ sasl.jaas.config=org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginMo
 ```
 
 The JVM system property `org.apache.kafka.sasl.oauthbearer.allowed.urls` must list the token and JWKS URLs. Kafka refuses to call other URLs, which prevents a malicious config from making the broker fetch arbitrary addresses.
+
+**How the client gets its token** is pluggable (`sasl.oauthbearer.jwt.retriever.class`):
+
+| Retriever | Grant | Use when |
+|---|---|---|
+| `ClientCredentialsJwtRetriever` | OAuth `client_credentials`, authenticating either with a client **secret** or with a **client assertion**: a JWT the client signs with its own private key (`sasl.oauthbearer.assertion.*`, RS256 by default), so no shared secret sits in client configs | The common case |
+| `JwtBearerJwtRetriever` | OAuth `urn:ietf:params:oauth:grant-type:jwt-bearer` (RFC 7523): the client exchanges a signed JWT for an access token | Your identity provider expects the JWT-bearer grant; must be configured explicitly |
+| `FileJwtRetriever` | None: reads a token from a file that something else refreshes | Kubernetes projected service-account tokens, sidecars |
+| `DefaultJwtRetriever` (default) | Delegates: `FileJwtRetriever` if `sasl.oauthbearer.token.endpoint.url` starts with `file:`, otherwise `ClientCredentialsJwtRetriever` | Backwards compatibility |
+
+On the broker side, the matching knob is `sasl.oauthbearer.jwt.validator.class` (`BrokerJwtValidator` for JWKS-based validation).
 
 ### SASL/GSSAPI (Kerberos)
 
@@ -714,7 +764,7 @@ Clients authenticate with `ScramLoginModule ... username="<tokenId>" password="<
 
 - `connections.max.reauth.ms` (broker, per listener and mechanism): long-lived SASL connections must re-authenticate before this interval, so revoked credentials and expired tokens stop working without closing connections.
 - `sasl.server.max.receive.size` (512 KiB default) bounds the size of SASL messages before authentication, which stops oversized unauthenticated payloads.
-- JAAS login modules are restricted by default (`org.apache.kafka.disallowed.login.modules`), which blocks dangerous modules such as JNDI-based ones.
+- JAAS login modules are restricted by default, which blocks dangerous modules such as JNDI-based ones. Use the system property `org.apache.kafka.allowed.login.modules` to turn this into an allow-list: only the modules you name can be used. The older deny-list property, `org.apache.kafka.disallowed.login.modules`, is deprecated since Kafka 4.2.
 
 ## 17. Principals: turning identities into names
 
@@ -737,7 +787,7 @@ ssl.principal.mapping.rules=\
 sasl.kerberos.principal.to.local.rules=RULE:[1:$1@$0](.*@EXAMPLE.COM)s/@.*//,DEFAULT
 ```
 
-**Fully custom:** implement `KafkaPrincipalBuilder` and set `principal.builder.class`. In KRaft it must also implement `KafkaPrincipalSerde`. Brokers forward admin requests to the controller inside an `Envelope` that carries the client's principal, so the principal must be serializable. The default builder (`DefaultKafkaPrincipalBuilder`) already does this.
+**Fully custom:** implement `KafkaPrincipalBuilder` and set `principal.builder.class`. Since Kafka 4.2 (KIP-1157) `KafkaPrincipalBuilder` extends `KafkaPrincipalSerde`, so a custom builder must implement serialization too. Brokers forward admin requests to the controller inside an `Envelope` that carries the client's principal, so the principal must be serializable. The default builder (`DefaultKafkaPrincipalBuilder`) already does this.
 
 ## 18. Authorization and ACLs
 
@@ -894,7 +944,7 @@ ssl.key.password=${dir:/run/secrets:ssl-key-password}
 
 Always set `allowed.paths`. Without it, a mistaken or malicious config could make the provider read any file the process can read.
 
-Sensitive **dynamic** broker configs (set with `kafka-configs.sh`, such as a new keystore password) are stored encrypted in the metadata log using `password.encoder.secret`. Rotating that secret needs `password.encoder.old.secret` and a rolling restart.
+Sensitive **dynamic** broker configs (set with `kafka-configs.sh`, such as a new keystore password) are stored **unencrypted** in the metadata log as `ConfigRecord`s; Kafka only hides their values in log output. The `password.encoder.*` settings that encrypted them in ZooKeeper mode were removed with ZooKeeper (`docs/getting-started/zk2kraft.md`). Note that `docs/security/security-model.md` in the Kafka source tree still describes the old behaviour. So anyone who can read a controller's or broker's metadata directory, or a metadata snapshot, can read those values: protect `metadata.log.dir` like a secrets store, or keep such secrets out of dynamic configs and load them through a config provider instead.
 
 ### Encryption at rest
 
@@ -971,6 +1021,7 @@ listener.name.external.scram-sha-512.sasl.jaas.config=org.apache.kafka.common.se
 listener.name.external.oauthbearer.sasl.server.callback.handler.class=org.apache.kafka.common.security.oauthbearer.OAuthBearerValidatorCallbackHandler
 listener.name.external.oauthbearer.sasl.oauthbearer.jwks.endpoint.url=https://idp.example.com/.well-known/jwks.json
 listener.name.external.oauthbearer.sasl.oauthbearer.expected.audience=kafka
+listener.name.external.oauthbearer.sasl.oauthbearer.expected.issuer=https://idp.example.com
 listener.name.external.oauthbearer.sasl.jaas.config=org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required;
 listener.name.external.oauthbearer.connections.max.reauth.ms=3600000
 
@@ -1005,11 +1056,11 @@ Tiered storage adds a new place where your data lives and new credentials to pro
 | RSM / RLMM interfaces, segment states | `storage/api/src/main/java/org/apache/kafka/server/log/remote/storage/` |
 | `RemoteLogManager` (copy, expire, follower tasks) | `storage/src/main/java/org/apache/kafka/server/log/remote/storage/RemoteLogManager.java` |
 | Tiered storage configs | `storage/.../remote/storage/RemoteLogManagerConfig.java` |
-| Remote reads and index cache | `storage/.../remote/storage/RemoteLogReader.java`, `RemoteIndexCache.java` |
+| Remote reads and index cache | `storage/.../remote/storage/RemoteLogReader.java`, `storage/src/main/java/org/apache/kafka/storage/internals/log/RemoteIndexCache.java` |
 | Default RLMM (`__remote_log_metadata`) | `storage/src/main/java/org/apache/kafka/server/log/remote/metadata/storage/TopicBasedRemoteLogMetadataManager.java` |
 | Follower bootstrap from remote | `core/src/main/java/kafka/server/TierStateMachine.java` |
-| Remote fetch purgatory | `core/src/main/scala/kafka/server/ReplicaManager.scala` (`DelayedRemoteFetch`) |
-| Test RSM | `storage/src/test/java/org/apache/kafka/server/log/remote/storage/LocalTieredStorage.java` |
+| Remote fetch purgatory | `storage/src/main/java/org/apache/kafka/server/purgatory/DelayedRemoteFetch.java` |
+| Test RSM | `storage/src/testFixtures/java/org/apache/kafka/server/log/remote/storage/LocalTieredStorage.java` |
 | SASL mechanisms | `clients/src/main/java/org/apache/kafka/common/security/{plain,scram,oauthbearer,kerberos,token}/` |
 | TLS | `clients/src/main/java/org/apache/kafka/common/security/ssl/` |
 | Principal builder | `clients/.../security/authenticator/DefaultKafkaPrincipalBuilder.java` |

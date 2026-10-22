@@ -2,7 +2,7 @@
 
 How records move from a producer, through replicated partition logs, to consumer groups, and how the KRaft controller quorum keeps the whole cluster agreeing on who leads what.
 
-Companion document: [tiered-storage-and-security.md](tiered-storage-and-security.md).
+Companion documents: [tiered-storage-and-security.md](tiered-storage-and-security.md) and [kraft.md](kraft.md) (KRaft in depth, with failure scenarios).
 
 ## Contents
 
@@ -100,34 +100,40 @@ Clients are smart. A producer or consumer asks any broker for metadata, learns w
 
 ```mermaid
 flowchart TB
-    subgraph Q["KRaft controller quorum"]
-        C1["C1 (active)"]
-        C2["C2"]
-        C3["C3"]
+    subgraph CP["Control plane · KRaft quorum · __cluster_metadata"]
+        direction LR
+        C1["C1<br/>active controller<br/>(Raft leader)"]
+        C2["C2<br/>voter"]
+        C3["C3<br/>voter"]
+        C2 -. "Fetch (replicate)" .-> C1
+        C3 -. "Fetch (replicate)" .-> C1
     end
-    subgraph B1["Broker 1"]
-        o0L["orders-0 LEADER"]
-        o1F1["orders-1 follower"]
-        o2F1["orders-2 follower"]
+    subgraph DP["Data plane · brokers"]
+        direction LR
+        subgraph B1["Broker 1"]
+            o0L["orders-0 ★"]
+            o1F1["orders-1"]
+            o2F1["orders-2"]
+        end
+        subgraph B2["Broker 2"]
+            o0F2["orders-0"]
+            o1L["orders-1 ★"]
+            o2F2["orders-2"]
+        end
+        subgraph B3["Broker 3"]
+            o0F3["orders-0"]
+            o1F3["orders-1"]
+            o2L["orders-2 ★"]
+        end
     end
-    subgraph B2["Broker 2"]
-        o0F2["orders-0 follower"]
-        o1L["orders-1 LEADER"]
-        o2F2["orders-2 follower"]
-    end
-    subgraph B3["Broker 3"]
-        o0F3["orders-0 follower"]
-        o1F3["orders-1 follower"]
-        o2L["orders-2 LEADER"]
-    end
-    PA["Producer A"] -- "produce" --> B1
-    PB["Producer B"] -- "produce" --> B2
-    B3 -- "fetch" --> G["Consumer group billing<br/>consumer 1, consumer 2"]
-    Q -- "brokers fetch the metadata log" --> B2
-    B2 -- "register, heartbeat" --> Q
+    DP -- "every broker: Fetch metadata log (observer)<br/>BrokerHeartbeat every 2 s" --> C1
+    P["Producers"] -- "Produce to the ★ leader<br/>of each partition" --> DP
+    DP -- "Fetch from the leader<br/>(or a same-rack follower)" --> G["Consumer group billing"]
+    o1F1 -. "follower Fetch" .-> o1L
+    o1F3 -. "follower Fetch" .-> o1L
 ```
 
-*One topic, three partitions, replication factor 3. Leadership is spread so each broker leads one partition. Producers and consumers talk only to leaders by default.*
+*One topic, three partitions, replication factor 3. ★ marks the leader replica; leadership is spread so each broker leads one partition. Followers copy their leader with the same `Fetch` request consumers use (drawn for `orders-1` only). Every broker replicates the metadata log from the active controller as a non-voting observer, and heartbeats to it. Clients never talk to controllers.*
 
 ### Vocabulary
 
@@ -171,12 +177,44 @@ A partition is a sequence of **segment files**. Each segment is named after its 
 
 Only the active segment is written to. Retention deletes whole old segments.
 
-### Four offsets you should know
+A new segment is **rolled** when the active one reaches `segment.bytes` (1 GB), when it is older than `segment.ms` (7 days), or when one of its indexes is full (`segment.index.bytes`, 10 MB). Retention can only delete closed segments, so on a low-traffic topic data can outlive `retention.ms` by up to `segment.ms`. Lower `segment.ms` if you need tight deletion deadlines.
 
-- **Log start offset**: the oldest offset still on disk. It moves forward when retention deletes segments (`retention.ms`, default 7 days, or `retention.bytes`).
+### What is on disk
+
+Each partition is a directory named `<topic>-<partition>` under one of the `log.dirs`:
+
+```
+/var/lib/kafka/data/                        one entry of log.dirs
+├── meta.properties                         cluster id, node id, directory id
+├── recovery-point-offset-checkpoint        per partition: offset known to be flushed to disk
+├── replication-offset-checkpoint           per partition: high watermark
+├── log-start-offset-checkpoint             per partition: log start offset
+├── cleaner-offset-checkpoint               per compacted partition: how far the cleaner got
+├── .kafka_cleanshutdown                    present only after a clean shutdown (skips recovery)
+└── orders-0/
+    ├── 00000000000000000000.log            the records (record batches, section 20)
+    ├── 00000000000000000000.index          sparse offset → file position
+    ├── 00000000000000000000.timeindex      sparse timestamp → offset
+    ├── 00000000000000000000.txnindex       aborted transactions in this segment (only if any)
+    ├── 00000000000004718592.log            next segment: its name is its base offset
+    ├── 00000000000004718592.index
+    ├── 00000000000004718592.timeindex
+    ├── 00000000000004718592.snapshot       producer state (ids, epochs, sequences) at this offset
+    ├── leader-epoch-checkpoint             which leader epoch started at which offset
+    └── partition.metadata                  the topic id, so a deleted-and-recreated topic is never confused with the old one
+```
+
+Files with other suffixes are transient: `.deleted` (a segment waiting `file.delete.delay.ms`, 60 s, before removal), `.cleaned` and `.swap` (compaction in progress), and directories ending in `-delete` (a deleted partition) or `-future` (a replica being moved to another disk with `kafka-reassign-partitions.sh`).
+
+### Five offsets you should know
+
+- **Log start offset**: the oldest offset still on disk. It moves forward when retention deletes segments (`retention.ms`, default 7 days, or `retention.bytes`), or when an admin calls `DeleteRecords`.
 - **Committed offset** (per consumer group): where that group will resume. It is stored by the group coordinator, not in the partition.
+- **Last stable offset (LSO)**: the first offset of the oldest transaction that is still open. `read_committed` consumers stop here (section 6). Without open transactions it equals the high watermark.
 - **High watermark (HW)**: the first offset not yet copied to every in-sync replica. Consumers can only read below it, which is why a record you have seen can never "disappear" after a leader change.
 - **Log end offset (LEO)**: the offset the next appended record will get.
+
+Always: log start ≤ LSO ≤ HW ≤ LEO.
 
 ### Keys decide the partition
 
@@ -190,6 +228,43 @@ Adding partitions later changes that mapping, so keys move to different partitio
 |---|---|---|
 | `cleanup.policy=delete` (default) | Old segments are dropped after time or size limits. | A time-bounded event history. |
 | `cleanup.policy=compact` | The log cleaner keeps at least the latest record per key and removes older ones. A record with a `null` value (a **tombstone**) deletes the key. | A changelog table. `__consumer_offsets` is compacted. |
+
+`delete,compact` combines both: compact by key, and also drop segments past retention.
+
+### How compaction works
+
+The log cleaner (`LogCleaner`, `log.cleaner.threads`, 1 by default) splits each compacted log into three regions:
+
+```
+ offset ─────────────────────────────────────────────────────────────────────────────►
+ ┌───────────── clean ─────────────┬──────── dirty, cleanable ────────┬─ uncleanable ─┐
+ │ already compacted: at most one  │ written since the last cleaning  │ active segment,│
+ │ record per key                  │ (duplicates likely)              │ records newer  │
+ │                                 │                                  │ than min.      │
+ │                                 │                                  │ compaction.lag,│
+ │                                 │                                  │ anything ≥ LSO │
+ └─────────────────────────────────┴──────────────────────────────────┴────────────────┘
+                                   ▲
+                       cleaner-offset-checkpoint
+```
+
+1. **Pick a log.** Each cleaner thread picks the log with the highest **dirty ratio** (dirty bytes ÷ total bytes) above `min.cleanable.dirty.ratio` (0.5). A log is also picked if a record has waited longer than `max.compaction.lag.ms`, which bounds how long an old value can survive.
+2. **Build an offset map.** Scan the dirty section and record `key → latest offset` in a fixed-size hash map (`log.cleaner.dedupe.buffer.size`, 128 MB, shared by all threads). If the map fills up, that cleaning covers only part of the dirty section.
+3. **Recopy.** Rewrite every segment from the start, dropping any record whose key appears in the map with a higher offset. Small adjacent segments are merged. Each rewritten segment is written to a `.cleaned` file, renamed to `.swap`, then swapped in, so a crash at any point leaves a consistent log. Offsets never change, which is why compacted topics have gaps.
+
+```
+before   k1=A  k2=B  k1=C  k3=D  k2=null  k1=E      (offsets 0..5)
+after    k3=D  k2=null  k1=E                         (offsets 3, 4, 5)
+later    k3=D  k1=E                                  (tombstone gone after delete.retention.ms)
+```
+
+Rules worth knowing:
+
+- **Tombstones** are kept for `delete.retention.ms` (1 day) after they reach the clean section, so that a consumer that is catching up still sees the delete. A consumer that is behind by more than that can miss deletes.
+- **`min.compaction.lag.ms`** (0) guarantees that a record stays uncompacted for at least that long, so consumers can see every intermediate value within that window.
+- **Transactions:** the cleaner never cleans beyond the last stable offset. Records of aborted transactions are removed regardless of key. Transaction markers are kept until all batches of their transaction are gone.
+- **Idempotence:** the last batch of each producer id is always kept, even if all its records are obsolete, so sequence numbers keep working.
+- Compaction is not instantaneous and not a uniqueness guarantee: until the cleaner runs, readers see every version. It guarantees *at least* the last value per key, not *only* the last value.
 
 **Tiered storage** (KIP-405) adds a third dimension: closed segments can be copied to object storage like S3, so the broker keeps only a hot tail on local disk while consumers can still read the full history. See the companion README.
 
@@ -209,24 +284,126 @@ ISR = {1, 2}. Broker 3 was removed after not catching up for replica.lag.time.ma
 
 The leader advances the **high watermark** to the lowest LEO among in-sync replicas. A slow follower does not hold the HW back forever: once it lags longer than `replica.lag.time.max.ms`, the leader asks the controller to shrink the ISR, and the HW moves on without it. When it catches up, it is added back.
 
+### How a write becomes committed
+
+Followers learn about new records and about the high watermark from the **same** Fetch exchange, one round apart. This is the real cost of `acks=all`:
+
+```mermaid
+sequenceDiagram
+    participant P as Producer (acks=all)
+    participant L as Leader (B1)
+    participant F as Follower (B2, in ISR)
+    P->>L: Produce batch → appended at offset 12, LEO 13
+    Note over L: request parked in DelayedProduce purgatory
+    F->>L: Fetch(offset=12)
+    L-->>F: records 12, HW=12
+    Note over F: appends 12, LEO 13<br/>its own HW is still 12
+    F->>L: Fetch(offset=13)
+    Note over L: B2's LEO is now 13 → every ISR member has 12<br/>HW 12 → 13, DelayedProduce completes
+    L-->>P: ack (offset 12)
+    L-->>F: no new records, HW=13
+    Note over F: follower HW → 13
+```
+
+- The leader learns that a follower has offset *n* only when that follower asks for *n + 1*. So `acks=all` costs at least one more follower fetch round trip after the append. Followers long-poll: an idle follower Fetch waits in purgatory for up to `replica.fetch.wait.max.ms` (500 ms) but is completed the moment new data is appended, so this is a network round trip, not a 500 ms wait.
+- A follower's high watermark trails the leader's. That is harmless: a follower serving reads (fetch-from-follower, section 7) only returns records below its *own* HW, so it can be slightly behind but never ahead, and a new leader recomputes the HW from its followers.
+- The produce completes when `HW ≥ batch end`. If the ISR shrank below `min.insync.replicas` while the request was parked, the producer gets `NOT_ENOUGH_REPLICAS_AFTER_APPEND`: the data *is* in the log, but the guarantee you asked for was not met. A retry with idempotence on writes no duplicate.
+
+**The exact high-watermark rule** (`Partition.maybeIncrementLeaderHW`):
+
+1. If the ISR is smaller than `min(min.insync.replicas, replication factor)`, the HW does **not** move at all (part of KIP-966). So `acks=1` writes to such a partition are accepted but stay invisible to consumers until the ISR recovers.
+2. Otherwise HW = the lowest LEO among the leader, the ISR, and any follower that has caught up and is about to be added back. Waiting for the joining follower stops it from being chased forever by a moving HW.
+3. Kafka uses the **maximal ISR** here: a replica the leader has asked to *add* counts immediately, a replica it has asked to *remove* still counts until the controller confirms (KIP-497). Both make the rule stricter, never looser.
+
+**When a follower leaves the ISR.** The leader tracks, per follower, the last time it was fully caught up to the leader's LEO. If that is more than `replica.lag.time.max.ms` (30 s) ago, the follower is out of sync, whether it is *stuck* (not fetching at all) or *slow* (fetching but never reaching the end). Then the leader sends `AlterPartition` to the controller.
+
 ### The in-sync replica set (ISR)
 
 The **ISR** is the set of replicas that are caught up enough to take over as leader without losing committed data.
 
-- The controller stores the ISR in metadata, and only the controller can change it. The leader asks for changes with `AlterPartition` requests.
-- When a leader dies, the controller picks a new leader from the ISR.
+- The controller stores the ISR in metadata, and only the controller can change it. The leader asks for changes with `AlterPartition` requests, tagged with the partition epoch, so a stale leader's request is rejected.
+- When a leader dies, the controller picks a new leader (see below).
 - `min.insync.replicas` (often set to 2) is the safety floor. A write with `acks=all` fails with `NotEnoughReplicas` if the ISR is smaller than this, instead of being accepted with too few copies.
 
-### Leader epochs
+The ISR is **not** "the other brokers":
 
-Every leader change bumps the partition's **leader epoch**. Each replica records which epoch began at which offset (the `leader-epoch-checkpoint` file).
+- It is **per partition**: each partition has its own ISR.
+- It contains only brokers that **hold a copy of that partition**. With RF 3 that is exactly 3 brokers, however large the cluster is.
+- Only the copies that are **caught up** count. A replica more than `replica.lag.time.max.ms` (30 s) behind is dropped until it catches up again.
+- It **includes the leader** itself.
 
-When a former leader comes back, it asks the new leader where its epoch ended and truncates any records past that point. Truncation can only remove records above the old high watermark, which no consumer was ever allowed to see.
+Six brokers, replication factor 3:
 
-### Newer refinements
+```
+partition    replicas (where copies live)    leader    ISR (caught-up copies, leader included)
+orders-0     [1, 2, 3]                       1         {1, 2, 3}     all caught up
+orders-1     [2, 4, 5]                       2         {2, 5}        broker 4 fell behind and was dropped
+orders-2     [3, 5, 6]                       3         {3, 5, 6}
+```
 
-- **Eligible Leader Replicas** (KIP-966) track replicas that dropped out of the ISR but are still known to hold all committed data. This makes leader election safer when `min.insync.replicas` is set.
-- `unclean.leader.election.enable=false` (the default) means Kafka would rather keep a partition offline than elect a replica that is missing committed data.
+An `acks=all` write to `orders-1` waits for brokers 2 and 5 only: not for broker 4, which is behind, and not for brokers 1, 3 and 6, which do not host that partition. When broker 4 catches up, leader 2 asks the controller to add it back, and the ISR becomes {2, 4, 5}. So: ISR ⊆ the partition's replicas ⊆ the brokers.
+
+### Requests are per broker, commits are per partition
+
+Network messages are grouped **per broker**, but every partition is still committed, and can fail, on its own.
+
+**Replication.** Broker 2 follows two partitions whose leader is broker 1, `orders-0` and `payments-3`. Its replica fetcher sends **one** Fetch to broker 1 for both, each with its own fetch offset:
+
+```
+Fetch from broker 2 → broker 1
+  orders-0     fetchOffset 4810
+  payments-3   fetchOffset 977
+```
+
+That one request tells broker 1 how far broker 2 has got in both partitions. Broker 1 still advances each partition's high watermark separately, because each has its own ISR: if `payments-3` also has a lagging replica on broker 3, `orders-0` commits while `payments-3` waits.
+
+**Producing.** A producer writing to both partitions sends **one** `ProduceRequest` to broker 1 (the Sender groups batches by broker, section 4). With `acks=all`, broker 1 sends **one** response, once **both** partitions have met their condition, with a separate result per partition:
+
+```
+ProduceResponse
+  orders-0     error NONE                  baseOffset 4810
+  payments-3   error NOT_ENOUGH_REPLICAS   (its ISR fell below min.insync.replicas)
+```
+
+One partition can succeed while the other fails in the same response. The producer completes the callbacks of the first batch and retries only the second.
+
+### Leader epochs and truncation
+
+Every leader change bumps the partition's **leader epoch**. Each replica records which epoch began at which offset (the `leader-epoch-checkpoint` file), and every batch carries the epoch it was written in (`PartitionLeaderEpoch`, section 20).
+
+Before KIP-101, a restarting replica truncated its log to its own high watermark. That is unsafe because a follower's HW lags the leader's by one fetch, as shown above:
+
+```
+step 1   A (leader)    [m0][m1]   HW=2    m1 is committed and acknowledged
+         B (follower)  [m0][m1]   HW=1    B learns HW=2 only on its next fetch
+step 2   B restarts and truncates to its own HW              → B = [m0]
+step 3   A dies before B fetches again; B becomes leader     → m1, already acknowledged, is lost
+```
+
+A variant of the same race, with both replicas restarting, left two replicas holding *different* records at the same offset.
+
+With epochs, a replica never truncates to its HW. It sends the epoch of its last record with each Fetch (`LastFetchedEpoch`). If its log has diverged, the leader answers with a **diverging epoch** ("epoch 1 ended at offset 1 in my log"), and the follower truncates to exactly that point and fetches again. In the example, B keeps `m1` because the leader's log agrees with it. Only records the current leader does not have are ever removed, and those were above the high watermark, so no consumer was allowed to see them.
+
+### Choosing a new leader
+
+When a leader is lost, the active controller elects a new one in `PartitionChangeBuilder`, in this order:
+
+```mermaid
+flowchart TD
+    S["leader lost<br/>(broker fenced or shut down)"] --> A{"a live replica<br/>in the ISR?"}
+    A -- yes --> L1["elect it<br/>(first in replica order)"]
+    A -- no --> B{"ISR empty and a live<br/>replica in the ELR?"}
+    B -- yes --> L2["elect it<br/>(no data loss)"]
+    B -- no --> C{"unclean leader election<br/>enabled for the topic?"}
+    C -- yes --> L3["elect any live replica<br/>⚠ committed data may be lost"]
+    C -- no --> O["partition stays offline<br/>until an ISR or ELR member returns"]
+```
+
+**Eligible Leader Replicas** (KIP-966, on by default for new clusters since 4.1 through `eligible.leader.replicas.version`) close a gap in that picture. When the ISR shrinks *below* `min.insync.replicas`, the replicas that leave it go into the **ELR** instead of being forgotten, because every committed record was written to them (the HW stopped advancing, rule 1 above). A replica that shuts down uncleanly is dropped from the ELR, because its unflushed tail may be gone. Once the ISR is back at `min.insync.replicas`, the ELR is cleared.
+
+The result: with `min.insync.replicas=2`, losing every ISR member no longer forces a choice between "offline forever" and "unclean election with data loss" as long as an ELR member comes back.
+
+`unclean.leader.election.enable=false` (the default) means Kafka would rather keep a partition offline than elect a replica that is missing committed data. It can be enabled per topic, or forced once with `kafka-leader-election.sh --election-type unclean`.
 
 ---
 
@@ -265,7 +442,20 @@ Key behaviours:
 - **Partitioner.** With a key: `murmur2(key) % partitions`. Without a key: the built-in partitioner sticks to one partition until a batch fills, then switches, preferring partitions on less-loaded brokers. Sticking avoids sending many tiny batches.
 - **Memory.** The accumulator has `buffer.memory` (32 MB). When it is full, `send()` blocks up to `max.block.ms`. That backpressure is how a fast producer learns the cluster is slow.
 - **Compression** (`compression.type`: `lz4`, `zstd`, `snappy`, `gzip`) is applied per batch. Brokers store the batch compressed and consumers decompress it, so the broker rarely does the work.
-- **Retries.** Retriable errors (leader moved, timeout) are retried until `delivery.timeout.ms` (2 minutes) runs out. On `NotLeaderOrFollower`, the producer refreshes metadata and resends to the new leader.
+- **Retries.** Retriable errors (leader moved, timeout) are retried until `delivery.timeout.ms` (2 minutes) runs out. On `NotLeaderOrFollower`, the producer resends to the new leader. Since KIP-951 the error response already names the new leader and its endpoint (`CurrentLeader`, `NodeEndpoints`), so the producer can redirect without a full metadata refresh. Consumers get the same help in Fetch responses.
+
+The timeline of one record, and which setting bounds each part:
+
+```
+send() ──► [ max.block.ms: wait for metadata / buffer space ]   (60 s; the only part that blocks your thread)
+             │
+             └─► delivery.timeout.ms (120 s) starts ────────────────────────────────────────────────┐
+                 [ linger.ms ] [ request ── request.timeout.ms (30 s) ] [ retry.backoff.ms ] [ request … ]
+                                                                                            │
+                 success, or TimeoutException when the whole budget is spent ◄──────────────┘
+```
+
+`delivery.timeout.ms` must be at least `linger.ms + request.timeout.ms`. If you set it lower explicitly, the producer refuses to start; if you only raised `linger.ms` or `request.timeout.ms`, it silently raises `delivery.timeout.ms` and logs a warning. Prefer raising `delivery.timeout.ms` over setting `retries`: with idempotence on, retries are cheap and safe, and the time budget is what you actually care about.
 
 ## 5. Acks and idempotence
 
@@ -303,6 +493,19 @@ sequenceDiagram
 
 The broker deduplicates by (producer ID, partition, sequence). Sequence gaps are rejected too, so ordering survives retries even with up to 5 requests in flight per connection.
 
+What the partition leader keeps per producer (`ProducerStateManager`, `ProducerStateEntry`):
+
+| State | Why |
+|---|---|
+| Producer id and epoch | A batch from an older epoch is rejected (`InvalidProducerEpoch`, or `ProducerFenced` for transactions) |
+| Metadata of the **last 5 batches** (first/last sequence, offsets) | A retried batch that matches one of them is answered with the original offset instead of being appended again. This is why `max.in.flight.requests.per.connection` must be ≤ 5 with idempotence. |
+| Last sequence | The next batch must start at last + 1, otherwise `OutOfOrderSequence` |
+| The first offset of an open transaction | Used to compute the last stable offset |
+
+This state is rebuilt from the log after a restart, starting from the nearest `.snapshot` file. A producer that writes nothing for `producer.id.expiration.ms` (1 day) is forgotten; its next write then gets `UnknownProducerId`, which the client handles by bumping its epoch and resetting sequences.
+
+Producer ids come from `InitProducerId`. Brokers do not invent them: each broker asks the controller for a block of 1,000 ids (`AllocateProducerIds`, recorded as a `ProducerIdsRecord` in the metadata log), so ids are unique across the cluster without coordination on every request.
+
 Idempotence covers **one producer session writing to one partition**. If your application restarts, it gets a new producer ID. Surviving restarts and writing atomically across partitions is what transactions are for.
 
 ## 6. Transactions
@@ -317,36 +520,80 @@ When a new instance starts with the same `transactional.id`, the epoch is bumped
 
 ### The commit protocol
 
+Kafka 4.x clusters run **transactions version 2** by default (`transaction.version=2`, KIP-890 part 2). The diagram shows that flow for a consume-transform-produce loop: read from `orders`, write to `payments-2` and `audit-0`, commit the input offset.
+
 ```mermaid
 sequenceDiagram
     participant P as Producer
-    participant TC as Transaction coordinator
-    participant TS as __transaction_state
-    participant A as orders-0 leader
-    participant B as payments-2 leader
+    participant TC as Transaction coordinator<br/>(leader of __transaction_state-k)
+    participant A as payments-2 leader
+    participant B as audit-0 leader
+    participant G as Group coordinator<br/>(of the input group)
     P->>TC: InitProducerId(transactional.id=checkout)
-    TC->>TS: PID 7, epoch 3 (fences epoch 2)
+    Note over TC: PID 7, epoch 3 → __transaction_state<br/>(fences any producer still on epoch 2,<br/>aborts its open transaction)
     TC-->>P: PID 7, epoch 3
-    P->>P: beginTransaction()
-    P->>TC: AddPartitionsToTxn(orders-0, payments-2)
-    TC->>TS: Ongoing, partitions={orders-0, payments-2}
     P->>A: Produce (transactional batch)
+    A->>TC: AddPartitionsToTxn(payments-2)  [sent by the leader, not the producer]
+    Note over TC: state Ongoing, partitions={payments-2}
+    A-->>P: appended
     P->>B: Produce (transactional batch)
-    P->>TC: commitTransaction() → EndTxn(COMMIT)
-    TC->>TS: PrepareCommit (the decision point)
+    B->>TC: AddPartitionsToTxn(audit-0)
+    B-->>P: appended
+    P->>G: TxnOffsetCommit(orders-1 → 4012)
+    Note over G: offset held as pending,<br/>invisible until the marker arrives
+    P->>TC: EndTxn(COMMIT)
+    Note over TC: PrepareCommit → __transaction_state<br/>THE DECISION POINT
+    TC-->>P: committed (the producer may start the next transaction)
     TC->>A: WriteTxnMarkers(COMMIT)
     TC->>B: WriteTxnMarkers(COMMIT)
-    TC->>TS: CompleteCommit
+    TC->>G: WriteTxnMarkers(COMMIT) on __consumer_offsets
+    Note over TC: CompleteCommit, epoch bumped to 4<br/>for the next transaction
 ```
 
-This is a two-phase commit with Kafka logs as the durable state. Once `PrepareCommit` is in `__transaction_state`, the commit will finish even if the coordinator crashes, because the next coordinator replays the log. Commit markers are special control records written into each data partition.
+- This is a two-phase commit with Kafka logs as the durable state. Once `PrepareCommit` is in `__transaction_state`, the commit *will* finish even if the coordinator crashes, because the next coordinator replays the log and resends the markers.
+- **Markers** are control batches written into every partition in the transaction, including the `__consumer_offsets` partition that holds the offsets. They are what turns the data from "pending" into "committed" or "aborted".
+- **What v2 changed** compared with the classic (v1) protocol:
+  - The producer no longer sends `AddPartitionsToTxn` or `AddOffsetsToTxn`. The partition leader registers the partition with the coordinator when the first transactional batch arrives (`AddPartitionsToTxnManager`). Before that registration is done, the batch is not appended, so a late batch from an old transaction can no longer slip into the next one, which was the main cause of **hanging transactions**.
+  - The epoch is bumped at the end of **every** transaction, so a delayed write from a finished transaction carries a stale epoch and is rejected.
+  - Older clients still work: for them the leader only *verifies* that the partition is in the transaction (KIP-890 part 1).
+
+### The transaction coordinator's state machine
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Empty: InitProducerId
+    Empty --> Ongoing: first partition or offsets added
+    Ongoing --> Ongoing: more partitions added
+    Ongoing --> PrepareCommit: EndTxn(COMMIT)
+    Ongoing --> PrepareAbort: EndTxn(ABORT), or transaction timeout
+    Ongoing --> PrepareEpochFence: a new producer with the same<br/>transactional.id calls InitProducerId
+    PrepareEpochFence --> PrepareAbort
+    PrepareCommit --> CompleteCommit: all markers written
+    PrepareAbort --> CompleteAbort: all markers written
+    CompleteCommit --> Ongoing: next transaction
+    CompleteAbort --> Ongoing: next transaction
+    CompleteCommit --> Dead: transactional.id expired
+    CompleteAbort --> Dead: transactional.id expired
+    Empty --> Dead: transactional.id expired
+```
+
+The states are in `transaction-coordinator/.../TransactionState.java`; `DescribeTransactions` and `kafka-transactions.sh describe` show them.
+
+| Timeout | Default | What happens |
+|---|---|---|
+| `transaction.timeout.ms` (producer) | 60 s | The coordinator proactively aborts a transaction open longer than this (checked every 10 s) and bumps the epoch. The producer's next transactional call fails, and the application must abort and start over. |
+| `transaction.max.timeout.ms` (broker) | 15 min | The largest timeout a producer may ask for |
+| `transactional.id.expiration.ms` (broker) | 7 days | A `transactional.id` with no transaction for this long is removed (`Dead`) |
 
 ### Reading transactional data
 
 - `isolation.level=read_committed`: consumers read only up to the **last stable offset** (LSO), the first offset that belongs to a transaction still open. Records from aborted transactions are filtered out.
 - `isolation.level=read_uncommitted` (the default): consumers read up to the high watermark and see everything, including aborted data.
 
-Kafka 4.x also includes **KIP-890** ("transactions server-side defense"): the epoch is bumped on every transaction, and the broker adds partitions to the transaction implicitly. This closes several hanging-transaction bugs.
+How aborted data is filtered without the broker decoding batches: every segment has a `.txnindex` listing the aborted transactions (producer id, first offset, last offset) that ended in it. For a `read_committed` fetch, the leader returns the data up to the LSO **plus** the list of aborted transactions overlapping that range. The consumer then drops batches from those producer ids within those offset ranges. The broker never rewrites data for this.
+
+**A long-open transaction stalls every `read_committed` consumer of that partition**, because the LSO cannot pass its first offset. That is why a "hanging" transaction looks like consumer lag that never shrinks; `kafka-transactions.sh find-hanging` and `abort` fix it.
 
 ---
 
@@ -376,7 +623,60 @@ Two different brokers matter to a consumer:
 - **Partition leaders** serve the data.
 - **The group coordinator** handles membership, assignment, and committed offsets.
 
-In the newer `AsyncKafkaConsumer` (used with `group.protocol=consumer`), network work runs on a background thread as drawn. The older `ClassicKafkaConsumer` does it inside `poll()`.
+In the newer `AsyncKafkaConsumer` (used with `group.protocol=consumer`), network work runs on a background thread as drawn. The older `ClassicKafkaConsumer` does it inside `poll()`, apart from a heartbeat thread.
+
+### The two-thread design of the new consumer
+
+`AsyncKafkaConsumer` never touches the network from your thread. The two threads talk only through queues of events:
+
+```mermaid
+flowchart LR
+    subgraph AppT["Application thread (your code)"]
+        API["poll() · commitSync() · seek()<br/>subscribe() · close()"]
+        FB[("FetchBuffer")]
+        CB["rebalance callbacks<br/>run here, inside poll()"]
+    end
+    subgraph NetT["ConsumerNetworkThread (background)"]
+        RM["Request managers:<br/>CoordinatorRequestManager<br/>ConsumerHeartbeatRequestManager<br/>ConsumerMembershipManager<br/>CommitRequestManager<br/>FetchRequestManager<br/>OffsetsRequestManager"]
+        NC["NetworkClient"]
+        RM --> NC
+    end
+    API -- "ApplicationEvent queue<br/>(AsyncPollEvent, CommitEvent, ...)" --> RM
+    RM -- "BackgroundEvent queue<br/>(errors, 'run onPartitionsRevoked')" --> CB
+    NC -- "completed fetches" --> FB
+    FB -- "records" --> API
+    NC <--> Brokers["brokers"]
+```
+
+- Heartbeats, coordinator discovery and fetches keep running while your code processes a batch. Only `max.poll.interval.ms` checks that your thread is still calling `poll()`.
+- Your `ConsumerRebalanceListener` still runs on **your** thread: the background thread sends an event and waits for the callback to complete before it tells the coordinator that partitions were released.
+- The consumer is still not thread-safe. All calls except `wakeup()` must come from one thread.
+
+### How a fetch works
+
+A `Fetch` request names many partitions at once, each with its fetch offset. The broker answers when one of these is true:
+
+| Condition | Setting (consumer) | Default |
+|---|---|---|
+| At least this many bytes are available across all partitions | `fetch.min.bytes` | 1 byte |
+| This much time has passed (long poll, `DelayedFetch` in purgatory) | `fetch.max.wait.ms` | 500 ms |
+
+and returns at most `max.partition.fetch.bytes` (1 MB) per partition and `fetch.max.bytes` (50 MB) per response. A batch bigger than those limits is still returned whole if it is the first one, so a large record never blocks a consumer.
+
+**Fetch sessions** (KIP-227). A consumer reading 1,000 partitions would otherwise list all 1,000 in every Fetch, several times per second. Instead, the first Fetch creates a session on the broker (`SessionId`, `SessionEpoch`), and later Fetches carry only the partitions whose fetch offset changed, plus `ForgottenTopicsData` for partitions to drop. Responses likewise omit partitions with nothing new. Brokers keep up to `max.incremental.fetch.session.cache.slots` (1,000) sessions and evict the least useful ones; an evicted client just falls back to a full Fetch. Followers use the same mechanism, which matters more for them since they fetch every partition they replicate.
+
+**Fetch from the closest replica** (KIP-392). Set `client.rack` on the consumer and `replica.selector.class=org.apache.kafka.common.replica.RackAwareReplicaSelector` on the brokers. The leader then answers the first Fetch with a `PreferredReadReplica`: a follower in the consumer's rack. The consumer fetches from that follower until it gets an error or `metadata.max.age.ms` (5 min) passes, then asks the leader again. Followers serve only up to their own high watermark, so data appears there slightly later than on the leader.
+
+**Where a consumer starts.** `auto.offset.reset` applies when there is no committed offset, or the committed offset is out of range:
+
+| Value | Starts at |
+|---|---|
+| `latest` (default) | The log end: only new records |
+| `earliest` | The log start offset |
+| `by_duration:P1D` | The first record with a timestamp within the given ISO-8601 duration from now (KIP-1106) |
+| `none` | Nowhere: `poll()` throws `NoOffsetForPartitionException`, so the application must decide |
+
+`by_duration` is often the right choice for new groups on long-retention topics: "start from roughly one day ago" instead of "everything" or "nothing".
 
 ### Position vs committed offset
 
@@ -391,10 +691,8 @@ The gap between them is what you might reprocess after a failure.
 
 - `enable.auto.commit=true` (default) commits the position every 5 s during `poll()`. Simple, but a crash can replay up to 5 s of records, or skip records if you hand them to another thread for processing.
 - Manual `commitSync()` / `commitAsync()` after processing gives you at-least-once with tight control.
-- `auto.offset.reset` (`latest` by default, or `earliest`) applies only when the group has no committed offset, or the committed offset points to data that retention already deleted.
+- `auto.offset.reset` (see the table above) applies only when the group has no committed offset, or the committed offset points to data that retention already deleted.
 - `max.poll.interval.ms` (5 min) is a liveness check on **your code**. If you do not call `poll()` within it, the consumer leaves the group and its partitions are reassigned.
-
-Consumers can also read from a follower in the same rack (`client.rack` on the client plus `replica.selector.class` on the broker), which saves cross-zone network cost.
 
 ## 8. Consumer groups
 
@@ -826,6 +1124,8 @@ The coordinator tracks three epochs to make this safe:
 - **Target assignment epoch**: the group epoch the current target assignment was computed for.
 - **Member epoch**: how far each member has reconciled. Offset commits carry it, so a member that is behind (a zombie) cannot commit for partitions it no longer owns.
 
+Since Kafka 4.3 the coordinator recomputes the target assignment at most once per `group.consumer.assignment.interval.ms` (1 s by default; share and streams groups have their own `*.assignment.interval.ms`), so a burst of joins during a deploy produces one new target instead of one per member.
+
 ### Side by side
 
 | | Classic | Consumer (KIP-848) |
@@ -854,6 +1154,111 @@ Consumer groups give each partition to one member, so you can never have more ac
 | Progress tracked as | One offset per partition | State per in-flight record |
 | Ordering | Strict per partition | Not guaranteed |
 | Good for | Event streams, CDC, aggregation | Work queues, jobs, fan-out workers |
+
+### Why share groups were needed
+
+Many teams use Kafka for **work queues**: each record is a job (send an email, resize an image, call a partner API) that any worker can do, in any order. Consumer groups fit that badly, and teams often ran RabbitMQ or SQS next to Kafka just for it. The problems:
+
+| Problem with a consumer group as a work queue | Why it happens | What a share group does instead |
+|---|---|---|
+| **Parallelism is capped by the partition count.** 12 partitions means at most 12 busy workers, even with 200 jobs waiting. | One partition, one owner (section 8.2) | Any number of members read the same partition |
+| **Over-partitioning to work around it** | Teams create hundreds of partitions "for the workers", paying in broker files, memory and slower failover (section 23) | Partitions can be sized for throughput only |
+| **Head-of-line blocking.** One slow or failing job stops every job behind it in that partition. | Progress is a single committed offset: you cannot commit offset 501 while 500 is unfinished | Each record is acknowledged on its own; other members keep taking later records |
+| **No per-record retry.** To retry one job you must stop the partition, or build retry topics and dead-letter topics yourself (section 25). | The broker knows only "this group is at offset N" | `RELEASE` puts a record back for redelivery; a delivery count limits retries |
+| **Scaling causes rebalances.** Adding or removing a worker moves partitions between members. | Assignment is per partition | Ownership is not exclusive, so nothing has to be revoked and handed over: adding or removing a member never pauses a partition |
+
+What you **give up**: ordering (records of one partition are processed by many members at once), the single "group is at offset N" position, and exactly-once processing (delivery is at-least-once: a record whose lock expires is redelivered, possibly while the first worker is still busy with it). If you need per-key order, keep a consumer group.
+
+A worker, in Scala (`KafkaShareConsumer`, explicit acknowledgement):
+
+```scala
+import java.time.Duration
+import java.util
+import org.apache.kafka.clients.consumer.{AcknowledgeType, KafkaShareConsumer}
+
+val props = new java.util.Properties()
+props.put("bootstrap.servers", "localhost:9092")
+props.put("group.id", "email-workers")                      // the share group
+props.put("share.acknowledgement.mode", "explicit")
+props.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer")
+props.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer")
+
+val consumer = new KafkaShareConsumer[String, String](props)
+consumer.subscribe(util.List.of("email-jobs"))
+
+while (true) {
+  consumer.poll(Duration.ofMillis(500)).forEach { record =>
+    val result =
+      try { sendEmail(record.value()); AcknowledgeType.ACCEPT }  // done
+      catch {
+        case _: TemporaryFailure => AcknowledgeType.RELEASE      // try again later, maybe on another worker
+        case _: Throwable        => AcknowledgeType.REJECT       // poison: never deliver again
+      }
+    consumer.acknowledge(record, result)
+  }
+  consumer.commitSync()   // sends the acknowledgements; returns a result per partition
+}
+```
+
+Run as many copies as you like with the same `group.id`; they share the work regardless of the partition count. Group-level settings such as `share.auto.offset.reset` (default `latest`), `share.isolation.level` (default `read_uncommitted`) and `share.record.lock.duration.ms` are set per group with `kafka-configs.sh --entity-type groups`.
+
+### The lifecycle of one record
+
+Each record in the in-flight window has a state (`RecordState`, in `server/.../share/fetch/`):
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Available: record is within the window
+    Available --> Acquired: ShareFetch hands it to a member<br/>(delivery count + 1, lock starts)
+    Acquired --> Acknowledged: ACCEPT
+    Acquired --> Available: RELEASE, or the lock expires,<br/>or the member leaves
+    Acquired --> Acquired: RENEW (extend the lock)
+    Acquired --> Archived: REJECT, or the delivery<br/>count limit is reached
+    Acknowledged --> [*]
+    Archived --> [*]
+```
+
+The window, per partition, lives on the partition's **leader** (`SharePartition`):
+
+```
+                    SPSO (share-partition start offset)               SPEO (end offset)
+                     ▼                                                  ▼
+ orders-0  … [✓][✓] [✓][A][⏳][⏳][✓][A][⏳][✗][⏳][A] [ not fetched yet … ]
+             done    └──────────────── in-flight window ───────────────┘
+
+ ✓ acknowledged   A available (to be delivered or redelivered)   ⏳ acquired (locked)   ✗ archived
+```
+
+- The SPSO moves forward only when every record behind it is acknowledged or archived. One slow record therefore holds the window open, and the window has a size cap (`group.share.partition.max.record.locks`, 2,000), after which no new records are acquired for that partition.
+- Locks last `group.share.record.lock.duration.ms` (30 s). A consumer that needs longer sends `RENEW`.
+- State changes are written through the share coordinator to `__share_group_state` (`WriteShareGroupState`), so a new leader resumes the window after a failover.
+
+### Using share groups
+
+| Config | Where | Default | Meaning |
+|---|---|---|---|
+| `share.acknowledgement.mode` | consumer | `implicit` | `implicit`: everything returned by `poll()` is accepted on the next `poll()` or `commit`. `explicit`: you call `acknowledge(record, type)` for each record. |
+| `share.acquire.mode` | consumer | `batch_optimized` | `record_limit` caps each `poll()` at `max.poll.records`; `batch_optimized` may return more to keep whole batches |
+| `group.share.record.lock.duration.ms` | broker / group | 30 s | Acquisition lock |
+| `group.share.delivery.count.limit` | broker / group | 5 | Attempts before a record is archived |
+| `group.share.partition.max.record.locks` | broker / group | 2,000 | Size of the in-flight window per partition |
+
+Members use `KafkaShareConsumer` and the RPCs `ShareGroupHeartbeat` (membership, like KIP-848), `ShareFetch` (fetch and acquire, with acknowledgements piggybacked) and `ShareAcknowledge`. Share groups are production-ready since Kafka 4.2.
+
+### Dead-letter topics for share groups
+
+Since Kafka 4.4 (KIP-1191, enabled when the `share.version` feature is upgraded to 2), records that are **rejected**, or **released past the delivery count limit**, can be sent to a dead-letter topic by the broker instead of only being archived. While a record is being written there it is in the `ARCHIVING` state.
+
+| Config | Level | Default | Meaning |
+|---|---|---|---|
+| `errors.deadletterqueue.topic.name` | group | empty (off) | The dead-letter topic for this share group |
+| `errors.deadletterqueue.copy.record.enable` | group | `false` | Copy the original key and value. By default only metadata is written: group, topic, partition, offset, delivery count. |
+| `errors.deadletterqueue.topic.name.prefix` | cluster (dynamic) | `dlq.` | Every dead-letter topic name must start with this prefix |
+| `errors.deadletterqueue.auto.create.topics.enable` | cluster (dynamic) | `false` | Let the broker create dead-letter topics |
+| `errors.deadletterqueue.group.enable` | topic | `false` | Required on a dead-letter topic you created yourself |
+
+On older clusters (or with `share.version` 1), archived records are not moved anywhere: if you need a dead-letter topic there, write the record to it yourself before rejecting it.
 
 ## 12. Delivery guarantees
 
@@ -989,7 +1394,7 @@ Each Fetch carries the follower's position, so the leader learns progress for fr
 
 ### Snapshots
 
-The metadata log would grow forever, so controllers and brokers periodically write a **snapshot**: the full metadata state as of some offset. Snapshots live in `metadata.log.dir`, in files named `<offset>-<epoch>.checkpoint`. The log before a snapshot can then be deleted.
+The metadata log would grow forever, so controllers and brokers periodically write a **snapshot**: the full metadata state as of some offset. Each node writes its own snapshot from its in-memory state when `metadata.log.max.record.bytes.between.snapshots` (20 MB) of new records have arrived, or after `metadata.log.max.snapshot.interval.ms` (1 h). Snapshots live in `metadata.log.dir`, in files named `<offset>-<epoch>.checkpoint`. The log before a snapshot can then be deleted.
 
 A brand-new broker, or one too far behind, downloads the latest snapshot with `FetchSnapshot` and then fetches only the records after it.
 
@@ -1019,6 +1424,57 @@ The state is split into **managers**, each owning one kind of record:
 | `AclControlManager` | ACLs |
 
 Standby controllers replay the same committed records into the same managers, so they are always ready to take over.
+
+### Speculative state and how it is undone
+
+Step 3 above means the active controller's in-memory state runs *ahead* of the committed log: the next event already sees the effect of records that a majority has not yet acknowledged. That lets the controller pipeline many changes without waiting for each commit. The price is that it must be able to throw those changes away.
+
+The managers therefore keep their state in **timeline data structures** (`TimelineHashMap`, `TimelineHashSet`, `TimelineLong`, … in `server-common/.../timeline/`). Each one records its history against a `SnapshotRegistry`, keyed by log offset:
+
+```
+committed offset 1000                        appended, not yet committed: 1001 … 1012
+        │                                                     │
+        ▼                                                     ▼
+ state @1000  ──(apply 1001…1012 speculatively)──►  current state seen by new events
+        ▲
+        └── on losing leadership: revertToSnapshot(1000), discard everything after
+```
+
+- Snapshots in the registry older than the committed offset are deleted as commits advance, so memory stays bounded.
+- A reply to the client waits for commit (a "deferred event" in `QuorumController`), but the next event does not.
+- If leadership is lost, the controller reverts to the last committed offset in memory and fails the pending requests with `NotController`; clients retry against the new controller.
+
+### The metadata records
+
+Everything the cluster knows is one of about 25 record types (`metadata/src/main/resources/common/metadata/*.json`):
+
+| Area | Records |
+|---|---|
+| Brokers and controllers | `RegisterBrokerRecord`, `UnregisterBrokerRecord`, `FenceBrokerRecord`, `UnfenceBrokerRecord`, `BrokerRegistrationChangeRecord`, `RegisterControllerRecord`, `UnregisterControllerRecord` |
+| Topics and partitions | `TopicRecord`, `PartitionRecord`, `PartitionChangeRecord`, `RemoveTopicRecord`, `ClearElrRecord` |
+| Configuration and features | `ConfigRecord`, `FeatureLevelRecord`, `ClientQuotaRecord` |
+| Security | `AccessControlEntryRecord`, `RemoveAccessControlEntryRecord`, `UserScramCredentialRecord`, `RemoveUserScramCredentialRecord`, `DelegationTokenRecord`, `RemoveDelegationTokenRecord` |
+| Producer ids | `ProducerIdsRecord` |
+| Atomic groups of records | `BeginTransactionRecord`, `EndTransactionRecord`, `AbortTransactionRecord` (KIP-868: brokers apply a large change, such as creating a topic with thousands of partitions, all at once or not at all) |
+| Housekeeping | `NoOpRecord` (written every `metadata.max.idle.interval.ms`, 500 ms, so the high watermark keeps moving and brokers can tell they are caught up) |
+
+`kafka-metadata-shell.sh` and `kafka-dump-log.sh --cluster-metadata-decoder` print them.
+
+### Feature flags
+
+Behaviour that changes the wire protocol or the metadata format is gated by **feature levels**, stored as `FeatureLevelRecord`s and raised with `kafka-features.sh upgrade` once every node runs new enough binaries:
+
+| Feature | Gates |
+|---|---|
+| `metadata.version` | The metadata record formats and most broker protocol changes. The "release version" of the cluster. |
+| `kraft.version` | Dynamic quorums (KIP-853) |
+| `transaction.version` | Transactions v2 (KIP-890) |
+| `group.version` | The KIP-848 consumer protocol on the broker |
+| `eligible.leader.replicas.version` | ELR (KIP-966) |
+| `share.version` | Share groups (KIP-932) |
+| `streams.version` | Streams groups (KIP-1071) |
+
+A newly formatted cluster starts at the latest *production* level of each feature for its release, so these are mostly visible during upgrades: until you raise a feature, the cluster behaves like the old version, and you can still downgrade the binaries.
 
 ### Example: creating a topic
 
@@ -1123,16 +1579,22 @@ Follow one order event from `send()` to a processed result, with every component
 | `buffer.memory` | producer | 32 MB | Accumulator size before `send()` blocks |
 | `delivery.timeout.ms` | producer | 120 s | Total time to keep retrying a record |
 | `transactional.id` | producer | none | Enables transactions and zombie fencing |
+| `transaction.timeout.ms` | producer | 60 s | Open transactions older than this are aborted by the coordinator |
+| `max.in.flight.requests.per.connection` | producer | 5 | Must stay ≤ 5 with idempotence |
 | `group.protocol` | consumer | `classic` | Old vs KIP-848 rebalance protocol |
 | `enable.auto.commit` | consumer | `true` | Background offset commits every 5 s |
 | `auto.offset.reset` | consumer | `latest` | Where to start with no committed offset |
 | `max.poll.interval.ms` | consumer | 300 s | Max time between `poll()` calls before eviction |
 | `isolation.level` | consumer | `read_uncommitted` | Whether to hide open/aborted transactions |
 | `group.instance.id` | consumer | none | Static membership |
-| `replication.factor` | topic | 1 (set 3) | Copies per partition |
+| `default.replication.factor` | broker | 1 (set 3) | Copies per partition when a topic is created without an explicit replication factor (`--replication-factor` / `NewTopic`) |
 | `min.insync.replicas` | topic / broker | 1 (set 2) | Minimum ISR for `acks=all` writes |
 | `retention.ms` | topic | 7 days | How long data is kept |
 | `cleanup.policy` | topic | `delete` | Delete old segments or compact by key |
+| `segment.bytes` / `segment.ms` | topic | 1 GB / 7 days | When the active segment rolls, and so the granularity of retention and compaction |
+| `min.cleanable.dirty.ratio` | topic | 0.5 | How dirty a compacted log must be before it is cleaned |
+| `delete.retention.ms` | topic | 1 day | How long tombstones survive in a compacted log |
+| `compression.type` | topic / broker | `producer` | Keep the producer's codec; any other value makes the broker recompress |
 | `unclean.leader.election.enable` | topic / broker | `false` | Allow electing an out-of-sync leader |
 | `replica.lag.time.max.ms` | broker | 30 s | When a slow follower leaves the ISR |
 | `offsets.topic.num.partitions` | broker | 50 | Spread of group coordinators |
@@ -1155,7 +1617,15 @@ Paths are relative to the root of the Kafka source tree.
 | Consumers | `clients/.../consumer/internals/AsyncKafkaConsumer.java` (new), `ClassicKafkaConsumer.java` |
 | Partition log on disk | `storage/src/main/java/org/apache/kafka/storage/internals/log/UnifiedLog.java`, `LogSegment.java`, `ProducerStateManager.java` |
 | Leader epochs | `storage/src/main/java/org/apache/kafka/storage/internals/epoch/LeaderEpochFileCache.java` |
-| Replication, ISR, HW | `core/src/main/scala/kafka/cluster/Partition.scala`, `core/src/main/scala/kafka/server/ReplicaManager.scala` |
+| Replication, ISR, HW | `core/src/main/scala/kafka/cluster/Partition.scala` (`maybeIncrementLeaderHW`, `maybeShrinkIsr`, `checkEnoughReplicasReachOffset`), `core/src/main/scala/kafka/server/ReplicaManager.scala` |
+| Follower fetching | `core/src/main/scala/kafka/server/ReplicaFetcherThread.scala`, `core/src/main/scala/kafka/server/AbstractFetcherThread.scala` |
+| Leader election, ELR | `metadata/src/main/java/org/apache/kafka/controller/PartitionChangeBuilder.java` |
+| Log validation, offsets, recompression | `storage/src/main/java/org/apache/kafka/storage/internals/log/LogValidator.java` |
+| Compaction | `storage/.../log/LogCleaner.java`, `LogCleanerManager.java`, `OffsetMap.java` |
+| Purgatory | `server/src/main/java/org/apache/kafka/server/purgatory/DelayedProduce.java`, `DelayedFetch.java`, `server-common/.../util/timer/TimingWheel.java` |
+| Transactions v2 on the broker | `server/src/main/java/org/apache/kafka/server/transaction/AddPartitionsToTxnManager.java`, `transaction-coordinator/.../TransactionState.java` |
+| Share partitions | `core/src/main/java/kafka/server/share/SharePartition.java`, `server/.../share/fetch/RecordState.java` |
+| Controller undo log | `server-common/src/main/java/org/apache/kafka/timeline/SnapshotRegistry.java`, `TimelineHashMap.java` |
 | Group coordinator | `group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java`, `GroupMetadataManager.java`, `modern/consumer/ConsumerGroup.java` |
 | Server-side assignors | `group-coordinator/src/main/java/org/apache/kafka/coordinator/group/assignor/` |
 | Assignor plugin API | `group-coordinator/group-coordinator-api/src/main/java/org/apache/kafka/coordinator/group/api/assignor/ConsumerGroupPartitionAssignor.java` |
@@ -1270,6 +1740,18 @@ TotalTimeMs = RequestQueueTimeMs + LocalTimeMs + RemoteTimeMs + ThrottleTimeMs +
 
 For example: produce p99 is 200 ms, and almost all of it is `RemoteTimeMs`. The leader is waiting for followers, so look at replica fetchers and follower disks, not at the leader.
 
+### The produce path, step by step
+
+What happens between "an I/O thread picks up a Produce request" and "the response is queued" (`KafkaApis.handleProduceRequest` → `ReplicaManager.appendRecords` → `Partition.appendRecordsToLeader` → `UnifiedLog.append`):
+
+1. **Authorize** the principal for `WRITE` on each topic, and for transactional batches also `WRITE` on the `transactional.id`.
+2. **Transactions:** for a transactional batch to a partition not yet in the transaction, ask the transaction coordinator first (`AddPartitionsToTxn`, section 6). The append waits for that answer.
+3. **Validate** each batch (`LogValidator`): CRC, record count, timestamps against `log.message.timestamp.before.max.ms` / `after.max.ms`, keys present on compacted topics, producer sequence and epoch.
+4. **Assign offsets** under the partition lock: overwrite `BaseOffset` with the log end offset. If the topic's `compression.type` is `producer` (the default) or equals the batch's codec, this is done **in place** without touching the records. Otherwise the broker must **decompress and recompress** every batch, which is expensive and a common hidden source of broker CPU load.
+5. **Append** to the active segment (a `write()` into the page cache), update the indexes every `index.interval.bytes`, and update the producer state.
+6. **Complete or park.** With `acks=0` or `1` the response is ready. With `acks=all` the request goes into the `DelayedProduce` purgatory until the high watermark passes it or `request.timeout.ms` (from the producer, sent in the request) runs out.
+7. **Wake waiters.** Every append also checks `DelayedFetch` for that partition, which is how long-polling consumers and followers get new data without waiting for their timeout.
+
 ## 22. The storage engine: page cache, zero-copy, and durability
 
 ### Kafka relies on the OS page cache
@@ -1300,11 +1782,25 @@ Kafka accepts this because losing data would require every ISR replica to lose p
 
 ### Recovery after an unclean shutdown
 
-If a broker crashes, the tail of its active segment may be incomplete. On restart, the broker scans segments written after the last recovery checkpoint, validates each batch's CRC, rebuilds indexes, and truncates anything corrupt. Recovery runs `num.recovery.threads.per.data.dir` (2) threads per log directory. On brokers with many partitions this can take minutes, so raise that value. A clean shutdown writes a marker file that skips this scan.
+If a broker crashes, the tail of its active segment may be incomplete. On restart, the broker scans segments written after the offset in `recovery-point-offset-checkpoint` (the point up to which data is known to be flushed), validates each batch's CRC, rebuilds indexes and producer state, and truncates anything corrupt. Recovery runs `num.recovery.threads.per.data.dir` (2) threads per log directory. On brokers with many partitions this can take minutes, so raise that value. A clean shutdown writes `.kafka_cleanshutdown`, which skips this scan.
+
+A truncated tail is not data loss in a replicated topic: the broker rejoins as a follower and fetches what it is missing from the leader. It also reports the unclean shutdown to the controller at registration, which removes it from the ELR of its partitions (section 3).
 
 ### Indexes and timestamps
 
-- The offset index is **sparse**: one entry every `index.interval.bytes` (4096 bytes) of log. Finding an offset is a binary search in the index followed by a short scan of the segment.
+- The offset index is **sparse**: one entry every `index.interval.bytes` (4096 bytes) of log. Finding an offset is a binary search in the index followed by a short scan of the segment:
+
+```
+Fetch(orders-0, offset 4718700)
+
+1. segments are kept in a skip list by base offset → pick 00000000000004718592.log
+2. .index (memory-mapped, entries are relative offset → byte position):
+      … (100 → 409600) (104 → 413700) (112 → 421888) …     binary search: 108 lies in 104…112
+3. read 00000000000004718592.log from byte 413700, skip batches until offset 4718700
+4. hand that file region to sendfile()
+```
+
+  A timestamp lookup (`ListOffsets` with a timestamp, `offsetsForTimes()`, `by_duration`) does the same through `.timeindex` first, to find an offset.
 - Each record has a timestamp. `message.timestamp.type=CreateTime` (the default) keeps the producer's timestamp. `LogAppendTime` makes the broker overwrite it with its own clock, which is safer for time-based retention when producer clocks cannot be trusted.
 - Time-based retention deletes a segment when its **largest** timestamp is older than `retention.ms`. One record with a timestamp far in the future can keep a whole segment alive. `log.message.timestamp.after.max.ms` rejects such records.
 
@@ -1555,7 +2051,7 @@ Offsets differ between clusters (the same record has a different offset in each)
 | Latency | `linger.ms` 0–5, smaller batches, `acks=1` only if you accept the loss risk |
 | Durability | `acks=all`, `enable.idempotence=true`, topic `min.insync.replicas=2` |
 
-Watch `record-error-rate`, `request-latency-avg`, `batch-size-avg`, `records-per-request-avg`, and `buffer-available-bytes` in the producer's metrics. This project's `ProducerOptions` defaults to `linger.ms=10`, 64 KB batches, and LZ4, a throughput-friendly starting point.
+Watch `record-error-rate`, `request-latency-avg`, `batch-size-avg`, `records-per-request-avg`, and `buffer-available-bytes` in the producer's metrics. This project's `ProducerConfig` defaults to `linger.ms=10`, 64 KB batches, and LZ4, a throughput-friendly starting point.
 
 ### Consumer
 
@@ -1732,7 +2228,7 @@ If you can answer these without looking, you understand Kafka well. Click to rev
 
 <details><summary>1. A producer uses <code>acks=all</code> on a topic with RF 3 and <code>min.insync.replicas=2</code>. Two brokers die. What happens to writes and reads?</summary>
 
-Writes to partitions whose ISR is now 1 fail with `NotEnoughReplicas`, because the ISR is below 2. Reads still work from the remaining leader (if it was in the ISR). The cluster chooses availability for reads and consistency for writes.
+Writes to partitions whose ISR is now 1 fail with `NotEnoughReplicas`, because the ISR is below 2. Consumers can still read everything up to the current high watermark from the remaining leader (if it was in the ISR), but the high watermark is frozen while the partition is under min ISR, so nothing new becomes visible, not even `acks=1` writes. The two lost replicas go into the ELR, so if the remaining leader also dies, one of them can take over without data loss when it returns.
 </details>
 
 <details><summary>2. Why can a consumer never read a record that is later lost in a leader failover?</summary>
@@ -1795,6 +2291,31 @@ In the classic protocol, a client leader computes the assignment after every mem
 Only when its group has no committed offset for that partition (a new group, or offsets expired after `offsets.retention.minutes`), or the committed offset is out of range, and `auto.offset.reset=earliest`. Otherwise it continues from the committed offset. You can also seek explicitly.
 </details>
 
+<details><summary>13. With <code>acks=all</code>, why does a produce take at least one extra follower round trip after the leader appends?</summary>
+
+The leader learns that a follower has offset *n* only when the follower's next Fetch asks for *n + 1*. The high watermark, and with it the produce response, can only move after that second fetch. The follower in turn learns the new high watermark one fetch later still.
+</details>
+
+<details><summary>14. A <code>read_committed</code> consumer's lag keeps growing on one partition, while a <code>read_uncommitted</code> consumer of the same partition is caught up. Why?</summary>
+
+An open (or hanging) transaction holds the last stable offset back. `read_committed` consumers cannot read past the first offset of the oldest open transaction. Find it with `kafka-transactions.sh find-hanging` and abort it, or fix the producer that never commits.
+</details>
+
+<details><summary>15. A compacted topic has <code>min.cleanable.dirty.ratio=0.5</code>. Why can a key still have many old versions on disk days later?</summary>
+
+The cleaner only picks a log once at least half of it is dirty, never touches the active segment, and on a low-traffic topic the active segment may not roll for `segment.ms` (7 days). Compaction guarantees *at least* the latest value per key, not *only* it. Lower `segment.ms`, `min.cleanable.dirty.ratio`, or set `max.compaction.lag.ms` to bound it.
+</details>
+
+<details><summary>16. Which replicas are in the ELR, and why is it safe to elect one of them although it is not in the ISR?</summary>
+
+Replicas that left the ISR while the ISR was below `min.insync.replicas`. While a partition is under min ISR its high watermark does not move, so nothing was committed after they left: they hold every committed record. Replicas that shut down uncleanly are removed from the ELR, because their unflushed tail may be gone. The controller elects from the ELR only when the ISR is empty.
+</details>
+
+<details><summary>17. Why did transactions v2 remove <code>AddPartitionsToTxn</code> from the producer?</summary>
+
+So that the partition leader, not the producer, registers the partition with the coordinator before appending a transactional batch. A delayed batch from a finished transaction can no longer be appended into the log of a later transaction (the cause of hanging transactions), and the per-transaction epoch bump rejects stale writes.
+</details>
+
 ## 36. Where to go next
 
 ### A learning path
@@ -1814,13 +2335,21 @@ KIPs (Kafka Improvement Proposals) explain *why* each feature works the way it d
 |---|---|
 | KIP-98 | Exactly-once: idempotence and transactions |
 | KIP-101 | Leader epochs for safe truncation |
+| KIP-227 | Incremental fetch sessions |
 | KIP-392 | Fetch from the closest replica |
+| KIP-497 | `AlterPartition` and the "maximal ISR" |
 | KIP-405 | Tiered storage |
 | KIP-500 / KIP-595 / KIP-631 | Replacing ZooKeeper: KRaft, the Raft protocol, the controller |
 | KIP-848 | The new consumer rebalance protocol |
 | KIP-853 | Dynamic KRaft quorums |
+| KIP-868 | Metadata transactions (atomic batches of metadata records) |
 | KIP-890 | Transactions server-side defense |
 | KIP-932 | Share groups (queues) |
 | KIP-966 | Eligible leader replicas |
+| KIP-951 | Leader discovery: new leader returned in Produce/Fetch errors |
 | KIP-996 | Pre-vote in KRaft |
 | KIP-1071 | Streams groups |
+| KIP-1106 | `auto.offset.reset=by_duration` |
+
+## JVM Production Settings for troubleshooting
+![alt text](image.png)
