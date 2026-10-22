@@ -1,4 +1,4 @@
-# Kafka 4.x, KRaft, 3 dedicated controllers + 3 brokers, TLS everywhere, SCRAM for clients,
+# 3 dedicated controllers + 3 brokers, TLS everywhere, SCRAM for clients,
 # ACLs with default deny, replication factor 3 / min.insync.replicas 2.
 #
 #   ./scripts/gen-certs.sh                  # once: CA, keystores, passwords into secrets/
@@ -17,10 +17,12 @@ x-kafka-node: &kafka-node
   init: true
   # Root filesystem is read-only; only the data volume and the tmpfs mounts are writable.
   read_only: true
+  # Owned by the image's user (appuser, uid 1000). Without uid/gid a tmpfs is recreated owned by
+  # root on every container restart, and the entrypoint can no longer write the rendered config.
   tmpfs:
-    - /tmp
-    - /etc/kafka/runtime
-    - /var/log/kafka
+    - /tmp:mode=1777
+    - /etc/kafka/runtime:uid=1000,gid=1000,mode=0750
+    - /var/log/kafka:uid=1000,gid=1000,mode=0750
   ulimits:
     nofile: { soft: 100000, hard: 100000 }
   # A clean shutdown moves leaderships away first and skips log recovery on restart.

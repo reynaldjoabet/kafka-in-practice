@@ -21,6 +21,8 @@ spec:
         runAsNonRoot: true
         runAsUser: 1000
         runAsGroup: 1000
+        # Secret files are mounted root-owned with mode 0440; fsGroup makes them group-readable by uid 1000.
+        fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
       containers:

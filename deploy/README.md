@@ -114,6 +114,78 @@ docker compose ps
 
 The memory and heap in `.env` are sized so six nodes fit on a laptop (about 18 GB in total). On real hosts, raise `BROKER_HEAP` to `-Xms6g -Xmx6g` and `BROKER_MEMORY` to at least 16g. The memory above the heap is the OS page cache, which serves most reads.
 
+### How `docker-compose.yml` is organised
+
+The blocks before `services:` are templates shared by the six Kafka containers, so each setting is written once. Three pieces of syntax make that work:
+
+| Syntax | From | Meaning |
+|---|---|---|
+| `x-controller-env:` | Compose | Any top-level key starting with `x-` is ignored by Compose, so it can hold shared blocks without creating a container |
+| `&controller-env` | YAML anchor | Names the block that follows |
+| `*controller-env` | YAML alias | Reuses that block as a value or list item |
+| `<<: *controller-env` | YAML merge key | Copies the block's keys into the surrounding mapping |
+
+```yaml
+x-controller-env: &controller-env          # shared environment for all controllers
+  KAFKA_ROLE: controller
+  CLUSTER_ID: ${CLUSTER_ID}
+  QUORUM_VOTERS: 1@controller-1:9093,2@controller-2:9093,3@controller-3:9093
+
+services:
+  controller-1:
+    <<: *kafka-node                        # image, entrypoint, tmpfs, ulimits, logging, network
+    environment:
+      <<: *controller-env                  # the shared environment above...
+      NODE_ID: 1                           # ...plus what is specific to this node
+    volumes:
+      - *templates                         # list items are reused with a plain alias
+    healthcheck: *controller-healthcheck   # a whole value reused as-is
+```
+
+| Template | Used by | Contains |
+|---|---|---|
+| `x-kafka-node` | all six nodes | Image, entrypoint, read-only root filesystem, tmpfs mounts, file limits, graceful stop, logging, network |
+| `x-controller-env` / `x-broker-env` | controllers / brokers | Role, cluster id, quorum voters, heap, and thread counts for brokers |
+| `x-common-mounts` | all six nodes | Config templates, scripts, CA certificate, node keystore password |
+| `x-controller-healthcheck` / `x-broker-healthcheck` | controllers / brokers | TCP check on port 9093 / 9092 |
+| `x-controller-resources` / `x-broker-resources` | controllers / brokers | Memory (and CPU for brokers) limits |
+
+Rules worth knowing:
+
+- **Keys written next to `<<:` win** over the template's keys, so a node can override any shared value.
+- **The merge is shallow.** `<<: *kafka-node` copies top-level keys only; a node that writes its own `tmpfs:` replaces the whole list instead of extending it. That is why `environment` has its own `<<: *controller-env` inside it.
+- **`<<:` only works inside a mapping.** List items use a plain alias (`- *templates`).
+- `docker compose config` prints the file with every template expanded, which is the quickest way to check what a container really gets.
+
+### Where the cluster id goes
+
+`CLUSTER_ID` never appears next to a Kafka setting in the compose file; it travels through four places:
+
+```
+.env                                   CLUSTER_ID=JyM8fjpPROuic6KuRywfKw
+  │  Compose reads .env automatically and substitutes ${CLUSTER_ID}
+  ▼
+docker-compose.yml                     x-controller-env / x-broker-env:   CLUSTER_ID: ${CLUSTER_ID}
+  │  each service merges one of them:  environment: { <<: *controller-env, NODE_ID: 1 }
+  ▼
+container environment variable         CLUSTER_ID=JyM8fjpPROuic6KuRywfKw   (in all six containers)
+  │
+  ▼
+scripts/kafka-entrypoint.sh            fails at startup if it is empty, then runs
+                                       kafka-storage.sh format --cluster-id "$CLUSTER_ID" --config ... --ignore-formatted
+```
+
+There is no `cluster.id` setting in `server.properties`. `kafka-storage.sh format` writes the id into `meta.properties` in the node's data volume, and Kafka reads it from there on every start.
+
+- **First start:** each container formats its empty volume with this id.
+- **Later starts:** `--ignore-formatted` makes the format a no-op, so the id already in `meta.properties` wins. Changing `CLUSTER_ID` in `.env` has no effect on existing volumes.
+- **All six must match:** a node whose `meta.properties` holds another cluster id cannot join, which protects against pointing a node at the wrong cluster's data.
+- **Starting over:** `docker compose down -v` to delete the volumes, then put a new id (`kafka-storage.sh random-uuid`) in `.env`.
+
+On Kubernetes the id comes from the `kafka-cluster` ConfigMap instead of `.env` (`k8s/controller.yaml`, `k8s/broker.yaml`); the entrypoint and `meta.properties` work the same way.
+
+`QUORUM_VOTERS` makes this a **static** KRaft quorum (`controller.quorum.voters`). See [kraft.md](../kraft.md), sections 8 and 9, for why a dynamic quorum is safer when a controller loses its disk.
+
 ### Connect an application from your machine
 
 ```properties
@@ -201,15 +273,39 @@ Brokers advertise their pod DNS names, so `kubectl port-forward` is not enough f
 
 ### Admin commands
 
+The admin pod needs the labels `app.kubernetes.io/name=kafka,app.kubernetes.io/component=admin` (the NetworkPolicy only lets labelled pods reach the brokers' INTERNAL port), `fsGroup: 1000` (to read the mounted secret, whose files are root-owned with mode 0440), and the generated Secret and ConfigMap names:
+
 ```bash
+TLS=$(kubectl -n kafka get secret -o name | grep kafka-admin-tls | cut -d/ -f2)
+CFG=$(kubectl -n kafka get configmap -o name | grep kafka-admin-config | cut -d/ -f2)
 kubectl -n kafka run kafka-admin --rm -it --restart=Never --image=apache/kafka:4.4.0 \
-  --overrides='{"spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":1000,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"kafka-admin","image":"apache/kafka:4.4.0","command":["bash"],"stdin":true,"tty":true,"securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}},"volumeMounts":[{"name":"tls","mountPath":"/etc/kafka/secrets"},{"name":"cfg","mountPath":"/etc/kafka/admin"}]}],"volumes":[{"name":"tls","secret":{"secretName":"<kafka-admin-tls-... name>"}},{"name":"cfg","configMap":{"name":"<kafka-admin-config-... name>"}}]}}'
-# get the generated names with: kubectl -n kafka get secret,configmap
+  --labels=app.kubernetes.io/name=kafka,app.kubernetes.io/component=admin \
+  --overrides='{"spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":1000,"runAsGroup":1000,"fsGroup":1000,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"kafka-admin","image":"apache/kafka:4.4.0","command":["bash"],"stdin":true,"tty":true,"securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}},"volumeMounts":[{"name":"tls","mountPath":"/etc/kafka/secrets"},{"name":"cfg","mountPath":"/etc/kafka/admin"}]}],"volumes":[{"name":"tls","secret":{"secretName":"'"$TLS"'"}},{"name":"cfg","configMap":{"name":"'"$CFG"'"}}]}}'
+
+# inside:
+B=kafka-broker-0.kafka-broker-headless.kafka.svc.cluster.local:9091 C=/etc/kafka/admin/admin.properties
+/opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server $B --command-config $C describe --replication
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $B --command-config $C --describe --topic orders
 ```
 
 ## How it was verified
 
-Docker was not running when this was written, so the stack has not yet been started with `docker compose up` or on a Kubernetes cluster. These checks were run:
+**Docker Compose** (Docker Desktop with 7.7 GB of memory, so heaps and memory limits were lowered through environment variables for the run; the files themselves were not changed):
+
+- All six nodes start healthy, `kafka-init` ends with "Cluster initialised", the quorum shows three caught-up voters and three observers, and `orders` has 12 partitions with full ISRs.
+- From the host over the `EXTERNAL` listener (SASL_SSL, SCRAM as `app`): `acks=all` produce to `orders` and consume as group `billing` work. A wrong password, a group without ACLs and a topic without ACLs are rejected with `SaslAuthenticationException`, `GroupAuthorizationException` and `TopicAuthorizationException`.
+- With one broker stopped, `acks=all` produce and consume still work (`min.insync.replicas=2`).
+- A stopped or restarted broker or controller comes back and catches up (no under-replicated partitions afterwards). This test found that the `tmpfs` mounts were recreated root-owned on every restart, which stopped the entrypoint from writing the config; they now set `uid=1000,gid=1000`.
+
+**Kubernetes** (minikube, 3 nodes, Calico so that NetworkPolicy is enforced; a test-only overlay lowered heaps, memory and volume sizes):
+
+- All controllers and brokers become ready under the `restricted` Pod Security Standard, one per node, and `kafka-init` completes.
+- An application pod in a namespace labelled `kafka-access=true` produces and consumes over `kafka.kafka.svc:9092`; the same pod in an unlabelled namespace cannot connect.
+- The admin pod from "Admin commands" can reach the brokers and describe the quorum and topics.
+- This test found two bugs, now fixed: the init job had no `fsGroup`, so it could not read its root-owned secret files; and admin pods were blocked by the NetworkPolicy, which now admits pods labelled `app.kubernetes.io/component=admin`.
+- minikube's default storage provisioner does not apply `fsGroup` to its `hostPath` volumes on worker nodes, so on a multi-node minikube the data directories there need `chmod 0777` before first start. CSI-based storage classes used in real clusters do not have this problem.
+
+Earlier, before Docker was available, these checks were also run:
 
 - `docker compose config` and `kubectl kustomize` both succeed, and the generated names are wired into the workloads.
 - The keystores made by OpenSSL open in Java's `keytool`, with the expected SANs and key usages.
