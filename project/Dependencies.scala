@@ -6,9 +6,9 @@ object Dependencies {
 
     val kafka           = "4.4.0"
     val fs2Kafka        = "4.1.3"
-    val jackson         = "3.2.3"
+    val jackson         = "3.2.4"
     val log4cats        = "2.8.0"
-    val logback         = "1.6.5"
+    val logback         = "1.6.6"
     val munit           = "1.3.6"
     val munitCatsEffect = "2.2.1"
     // Same version as Kafka's own build.
