@@ -13,8 +13,8 @@ import cats.syntax.all.*
 import fs2.kafka.*
 import fs2.Chunk
 
-import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator
 import io.opentelemetry.api.common.AttributeKey
+import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator
 import io.opentelemetry.api.trace.SpanKind
 import io.opentelemetry.sdk.trace.data.SpanData
 import munit.CatsEffectSuite
@@ -275,27 +275,27 @@ class KafkaClientsIntegrationSpec extends CatsEffectSuite {
       .use { testkit =>
         given TracerProvider[IO] = testkit.tracerProvider
         for {
-          tracing           <- Tracing.create[IO]()
-          given Tracing[IO]  = tracing
-          _                 <- createTopic(topic, partitions = 1)
-          _                 <- produce(topic, List("a" -> "ok", "b" -> "fail"))
-          handled           <- Ref[IO].of(Set.empty[String])
-          attempts          <- Ref[IO].of(0)
-          _                 <- consumeUntil(
+          tracing          <- Tracing.create[IO]()
+          given Tracing[IO] = tracing
+          _                <- createTopic(topic, partitions = 1)
+          _                <- produce(topic, List("a" -> "ok", "b" -> "fail"))
+          handled          <- Ref[IO].of(Set.empty[String])
+          attempts         <- Ref[IO].of(0)
+          _                <- consumeUntil(
                  consumerConfig(topic, group, Some(dlq)),
                  Deserializer.string[IO],
                  (handled.get, attempts.get).mapN((h, n) => h("ok") && n == 3)
                ) { r =>
-                 if r.value == "fail" then
-                   attempts.update(_ + 1) >> IO.raiseError(new RuntimeException("downstream down"))
+                 if r.value == "fail" then attempts
+                   .update(_ + 1) >> IO.raiseError(new RuntimeException("downstream down"))
                  else handled.update(_ + r.value)
                }
           _     <- readAll(dlq, 1)
           spans <- testkit.finishedSpans
         } yield {
           // -language:strictEquality: Java enums need an explicit CanEqual.
-          given CanEqual[SpanKind, SpanKind] = CanEqual.derived
-          def named(name: String)             = spans.filter(_.getName == name)
+          given CanEqual[SpanKind, SpanKind]       = CanEqual.derived
+          def named(name: String)                  = spans.filter(_.getName == name)
           def events(span: SpanData, name: String) =
             span.getEvents.asScala.filter(_.getName == name).toList
 
@@ -323,8 +323,14 @@ class KafkaClientsIntegrationSpec extends CatsEffectSuite {
           val failedSpan = failed.get
           assertEquals(events(failedSpan, "kafkainpractice.retry").size, 2, "two retries")
           val deadLetter = events(failedSpan, "kafkainpractice.dead_letter").head.getAttributes
-          assertEquals(deadLetter.get(AttributeKey.stringKey("kafkainpractice.dead_letter.topic")), dlq)
-          assertEquals(deadLetter.get(AttributeKey.stringKey("kafkainpractice.dead_letter.stage")), "Handler")
+          assertEquals(
+            deadLetter.get(AttributeKey.stringKey("kafkainpractice.dead_letter.topic")),
+            dlq
+          )
+          assertEquals(
+            deadLetter.get(AttributeKey.stringKey("kafkainpractice.dead_letter.stage")),
+            "Handler"
+          )
           assertEquals(
             deadLetter.get(AttributeKey.longKey("kafkainpractice.dead_letter.attempts")),
             java.lang.Long.valueOf(3L)

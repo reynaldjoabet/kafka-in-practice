@@ -38,11 +38,11 @@ object Dependencies {
   // otel4s backend on the OpenTelemetry Java SDK, and the OTLP exporter the SDK is auto-configured
   // with (OTEL_* environment variables). The testkit keeps spans in memory for assertions.
   val tracing = Seq(
-    "io.github.irevive" %% "fs2-kafka-otel4s-trace"                   % Versions.fs2KafkaOtel4s,
-    "org.typelevel"     %% "otel4s-oteljava"                          % Versions.otel4s,
+    "io.github.irevive" %% "fs2-kafka-otel4s-trace"                    % Versions.fs2KafkaOtel4s,
+    "org.typelevel"     %% "otel4s-oteljava"                           % Versions.otel4s,
     "io.opentelemetry"   % "opentelemetry-sdk-extension-autoconfigure" % Versions.openTelemetry,
-    "io.opentelemetry"   % "opentelemetry-exporter-otlp"              % Versions.openTelemetry,
-    "org.typelevel"     %% "otel4s-oteljava-testkit"                  % Versions.otel4s % Test
+    "io.opentelemetry"   % "opentelemetry-exporter-otlp"               % Versions.openTelemetry,
+    "org.typelevel"     %% "otel4s-oteljava-testkit"                   % Versions.otel4s % Test
   )
 
   val testing = Seq(

@@ -48,8 +48,8 @@ final case class ProducerConfig(
   * Every `send` method returns only after the brokers have acknowledged the records, so a
   * successful result means the records are durably written (`acks=all`).
   *
-  * With a [[Tracing]] in scope, every send creates a `send <topic>` span and writes its trace context
-  * into the record headers, so consumers can link their processing to it.
+  * With a [[Tracing]] in scope, every send creates a `send <topic>` span and writes its trace
+  * context into the record headers, so consumers can link their processing to it.
   */
 final class EventProducer[F[_]: Async, K, V] private (producer: KafkaProducer[F, K, V]) {
 

@@ -11,14 +11,14 @@ import org.typelevel.otel4s.trace.{Tracer, TracerProvider}
   * OpenTelemetry tracing for [[EventProducer]] and [[EventConsumer]].
   *
   *   - `kafka` (fs2-kafka-otel4s) creates the messaging spans: `send <topic>` on the producer, with
-  *     the trace context written into the record headers, and `process <topic>` around each consumed
-  *     record, linked to the producer's span through those headers.
+  *     the trace context written into the record headers, and `process <topic>` around each
+  *     consumed record, linked to the producer's span through those headers.
   *   - `tracer` is used by the consumer to annotate the current `process` span: retries and
   *     dead-lettering are recorded as span events, so one span shows everything that happened to a
   *     record.
   *
-  * Both clients take a `Tracing` as a `using` parameter. Without one in scope, the companion's no-op
-  * instance is used and nothing is traced. To trace, put one in scope:
+  * Both clients take a `Tracing` as a `using` parameter. Without one in scope, the companion's
+  * no-op instance is used and nothing is traced. To trace, put one in scope:
   *
   * {{{
   * OtelJava.autoConfigured[IO]().evalMap(otel => Tracing.create[IO](using otel.tracerProvider))
@@ -32,7 +32,9 @@ final case class Tracing[F[_]](kafka: KafkaTracer[F], tracer: Tracer[F])
 
 object Tracing {
 
-  /** The instrumentation scope name of the spans and events this project adds itself. */
+  /**
+    * The instrumentation scope name of the spans and events this project adds itself.
+    */
   val InstrumentationName = "kafkainpractice"
 
   def create[F[_]: Concurrent: Parallel: TracerProvider](
@@ -56,8 +58,8 @@ object Tracing {
   given rawKey: KafkaMessageKey[Array[Byte]] = KafkaMessageKey.instance(_ => None)
 
   /**
-    * For key types without a `KafkaMessageKey` instance (the library has String, Int, Long and UUID):
-    * the key attribute is omitted instead of requiring every caller to define one.
+    * For key types without a `KafkaMessageKey` instance (the library has String, Int, Long and
+    * UUID): the key attribute is omitted instead of requiring every caller to define one.
     */
   def unknownKey[K]: KafkaMessageKey[K] = KafkaMessageKey.instance(_ => None)
 

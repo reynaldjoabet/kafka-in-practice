@@ -114,8 +114,8 @@ object DeadLetterHeaders {
   *     reaches the dead-letter topic unchanged instead of failing the stream.
   *   - On cancellation (e.g. SIGTERM through `IOApp`), it stops fetching, finishes the records
   *     already fetched, commits their offsets and only then leaves the group.
-  *   - With a [[Tracing]] in scope, each record is handled inside a `process <topic>` span linked to
-  *     the producer's `send` span (through the record headers). Retries and dead-lettering are
+  *   - With a [[Tracing]] in scope, each record is handled inside a `process <topic>` span linked
+  *     to the producer's `send` span (through the record headers). Retries and dead-lettering are
   *     added to that span as events, the dead-letter send is its child, and commits get their own
   *     `commit` spans. Spans the handler creates are children of the `process` span.
   *
@@ -247,7 +247,9 @@ final class EventConsumer[F[_]: Async: Parallel, K, V] private (
         )
     }
 
-  /** Adds an event, with the error's type and message, to the current (`process`) span. */
+  /**
+    * Adds an event, with the error's type and message, to the current (`process`) span.
+    */
   private def spanEvent(name: String, error: Throwable, attributes: Attribute[?]*): F[Unit] =
     tracing.tracer.currentSpanOrNoop.flatMap { span =>
       span.addEvent(
