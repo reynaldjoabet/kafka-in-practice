@@ -5,18 +5,18 @@ object Dependencies {
   private object Versions {
 
     val kafka           = "4.4.0"
-    val fs2Kafka        = "4.1.3"
-    val jackson         = "3.2.4"
+    val fs2Kafka        = "4.2.0"
+    val jackson         = "3.3.0"
     val log4cats        = "2.8.0"
-    val logback         = "1.6.6"
+    val logback         = "1.6.8"
     val munit           = "1.3.6"
     val munitCatsEffect = "2.2.1"
     val fs2KafkaOtel4s  = "0.3.0"
-    val otel4s          = "1.1.0"
+    val otel4s          = "1.2.0"
     // The OpenTelemetry Java SDK. All io.opentelemetry artifacts must share one version.
-    val openTelemetry = "1.67.0"
-    // Same version as Kafka's own build.
-    val bouncyCastle = "1.86"
+    val openTelemetry = "1.68.0"
+    // Test only: needed by the Kafka test kit's TLS helpers.
+    val bouncyCastle = "1.87"
 
   }
 
