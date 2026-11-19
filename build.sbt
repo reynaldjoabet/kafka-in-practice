@@ -24,8 +24,9 @@ lazy val root = (project in file("."))
       Dependencies.kafka ++
         Dependencies.json ++
         Dependencies.logging ++
+        Dependencies.tracing ++
         Dependencies.testing ++
-        Dependencies.kafkaTestKit,
+        Dependencies.kafkaTestKit ,
     // The test broker runs inside the test JVM; fork so it gets its own
     // heap and is torn down with the forked JVM.
     Test / fork := true

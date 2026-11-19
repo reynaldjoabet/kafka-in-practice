@@ -11,6 +11,10 @@ object Dependencies {
     val logback         = "1.6.6"
     val munit           = "1.3.6"
     val munitCatsEffect = "2.2.1"
+    val fs2KafkaOtel4s  = "0.3.0"
+    val otel4s          = "1.1.0"
+    // The OpenTelemetry Java SDK. All io.opentelemetry artifacts must share one version.
+    val openTelemetry = "1.67.0"
     // Same version as Kafka's own build.
     val bouncyCastle = "1.86"
 
@@ -28,6 +32,17 @@ object Dependencies {
   val logging = Seq(
     "org.typelevel" %% "log4cats-slf4j"  % Versions.log4cats,
     "ch.qos.logback" % "logback-classic" % Versions.logback
+  )
+
+  // Tracing: OpenTelemetry spans for fs2-kafka producers and consumers (fs2-kafka-otel4s), the
+  // otel4s backend on the OpenTelemetry Java SDK, and the OTLP exporter the SDK is auto-configured
+  // with (OTEL_* environment variables). The testkit keeps spans in memory for assertions.
+  val tracing = Seq(
+    "io.github.irevive" %% "fs2-kafka-otel4s-trace"                   % Versions.fs2KafkaOtel4s,
+    "org.typelevel"     %% "otel4s-oteljava"                          % Versions.otel4s,
+    "io.opentelemetry"   % "opentelemetry-sdk-extension-autoconfigure" % Versions.openTelemetry,
+    "io.opentelemetry"   % "opentelemetry-exporter-otlp"              % Versions.openTelemetry,
+    "org.typelevel"     %% "otel4s-oteljava-testkit"                  % Versions.otel4s % Test
   )
 
   val testing = Seq(

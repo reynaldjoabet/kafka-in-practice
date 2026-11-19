@@ -11,6 +11,7 @@ import cats.effect.syntax.all.*
 import cats.syntax.all.*
 import cats.Parallel
 import fs2.kafka.*
+import fs2.kafka.otel4s.trace.TracedKafkaConsumer
 
 import org.apache.kafka.clients.consumer.{
   ConsumerConfig as KafkaConsumerConfig,
@@ -18,6 +19,7 @@ import org.apache.kafka.clients.consumer.{
 }
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 import org.typelevel.log4cats.Logger
+import org.typelevel.otel4s.Attribute
 
 /**
   * Consumer tuning.
@@ -112,6 +114,10 @@ object DeadLetterHeaders {
   *     reaches the dead-letter topic unchanged instead of failing the stream.
   *   - On cancellation (e.g. SIGTERM through `IOApp`), it stops fetching, finishes the records
   *     already fetched, commits their offsets and only then leaves the group.
+  *   - With a [[Tracing]] in scope, each record is handled inside a `process <topic>` span linked to
+  *     the producer's `send` span (through the record headers). Retries and dead-lettering are
+  *     added to that span as events, the dead-letter send is its child, and commits get their own
+  *     `commit` spans. Spans the handler creates are children of the `process` span.
   *
   * At-least-once means a record can be handled more than once: after a crash, or after a rebalance
   * that moves a partition before its last offsets were committed. Make the handler idempotent, for
@@ -122,10 +128,12 @@ final class EventConsumer[F[_]: Async: Parallel, K, V] private (
     keyDeserializer: KeyDeserializer[F, K],
     valueDeserializer: ValueDeserializer[F, V],
     deadLetters: Option[KafkaProducer[F, Array[Byte], Array[Byte]]],
-    logger: Logger[F]
+    logger: Logger[F],
+    tracing: Tracing[F]
 )(using Random[F]) {
 
   import EventConsumer.*
+  import Tracing.rawKey
 
   /**
     * Consumes until cancelled or until a record fails without a dead-letter topic.
@@ -133,21 +141,26 @@ final class EventConsumer[F[_]: Async: Parallel, K, V] private (
   def run(handler: ConsumerRecord[K, V] => F[Unit]): F[Unit] =
     KafkaConsumer.resource(EventConsumer.settings[F](config)).use { consumer =>
       Async[F].uncancelable { poll =>
-        consume(consumer, handler).start.flatMap { fiber =>
+        consume(tracing.kafka.consumer(consumer), handler).start.flatMap { fiber =>
           poll(fiber.joinWithNever).onCancel(stopGracefully(consumer, fiber))
         }
       }
     }
 
   private def consume(
-      consumer: KafkaConsumer[F, Array[Byte], Array[Byte]],
+      traced: TracedKafkaConsumer[F, Array[Byte], Array[Byte]],
       handler: ConsumerRecord[K, V] => F[Unit]
   ): F[Unit] =
-    consumer.subscribe(config.topics) >>
-      consumer.partitionedRecords
-        .map(_.evalMap(committable => process(committable.record, handler).as(committable.offset)))
+    traced.underlying.subscribe(config.topics) >>
+      traced.underlying.partitionedRecords
+        .map(_.evalMap { committable =>
+          // The span covers decoding, every retry and the dead-letter send of this record.
+          traced.spans
+            .process(committable)(process(committable.record, handler))
+            .as(committable.offset)
+        })
         .parJoinUnbounded
-        .through(commitBatchWithin(config.commitEvery, config.commitWithin))
+        .through(traced.spans.commitBatchWithin(config.commitEvery, config.commitWithin))
         .compile
         .drain
 
@@ -188,6 +201,11 @@ final class EventConsumer[F[_]: Async: Parallel, K, V] private (
             onRetry = (attempt, e) =>
               logger.warn(e)(
                 s"Handler failed for ${position(raw)}, retry $attempt of ${config.retry.maxRetries}"
+              ) >> spanEvent(
+                "retry",
+                e,
+                Attribute("kafkainpractice.retry.attempt", attempt.toLong),
+                Attribute("kafkainpractice.retry.max", config.retry.maxRetries.toLong)
               )
           )
           .flatMap {
@@ -214,6 +232,12 @@ final class EventConsumer[F[_]: Async: Parallel, K, V] private (
           .withHeaders(raw.headers.concat(deadLetterHeaders(raw, stage, error, attempts)))
         logger.error(error)(
           s"Sending ${position(raw)} to $topic after $attempts attempt(s) ($stage)"
+        ) >> spanEvent(
+          "dead_letter",
+          error,
+          Attribute("kafkainpractice.dead_letter.topic", topic),
+          Attribute("kafkainpractice.dead_letter.stage", stage.toString),
+          Attribute("kafkainpractice.dead_letter.attempts", attempts.toLong)
         ) >>
           // Wait for the acknowledgement: the source offset is committed right after this.
           producer.produce(ProducerRecords.one(record)).flatten.void
@@ -221,6 +245,18 @@ final class EventConsumer[F[_]: Async: Parallel, K, V] private (
         Async[F].raiseError(
           RecordProcessingException(raw.topic, raw.partition, raw.offset, attempts, error)
         )
+    }
+
+  /** Adds an event, with the error's type and message, to the current (`process`) span. */
+  private def spanEvent(name: String, error: Throwable, attributes: Attribute[?]*): F[Unit] =
+    tracing.tracer.currentSpanOrNoop.flatMap { span =>
+      span.addEvent(
+        s"kafkainpractice.$name",
+        (attributes ++ List(
+          Attribute("exception.type", error.getClass.getName),
+          Attribute("exception.message", Option(error.getMessage).getOrElse(""))
+        ))*
+      )
     }
 
   private def deadLetterHeaders(
@@ -265,20 +301,28 @@ object EventConsumer {
   /**
     * Builds the consumer. With a dead-letter topic it also opens a producer, which `producer` can
     * share with the rest of the application.
+    *
+    * @param tracing
+    *   no-op unless the caller has a `given Tracing[F]`
     */
   def resource[F[_]: Async: Parallel, K, V](
       config: ConsumerConfig,
       keyDeserializer: KeyDeserializer[F, K],
       valueDeserializer: ValueDeserializer[F, V],
       producer: Option[ProducerConfig] = None
-  ): Resource[F, EventConsumer[F, K, V]] = {
+  )(using tracing: Tracing[F]): Resource[F, EventConsumer[F, K, V]] = {
+    import Tracing.rawKey
     val deadLetterProducer = config.deadLetterTopic.traverse { _ =>
       val producerConfig = producer.getOrElse(
         ProducerConfig(config.connection.copy(clientId = s"${config.connection.clientId}-dlq"))
       )
-      KafkaProducer.resource(
-        EventProducer.settings(producerConfig, Serializer.identity[F], Serializer.identity[F])
-      )
+      KafkaProducer
+        .resource(
+          EventProducer.settings(producerConfig, Serializer.identity[F], Serializer.identity[F])
+        )
+        // Traced: the dead-letter send becomes a child of the record's process span. The record
+        // keeps its original headers, including the producer's trace context.
+        .map(tracing.kafka.producer(_))
     }
     for {
       dlq    <- deadLetterProducer
@@ -286,7 +330,7 @@ object EventConsumer {
       logger <- Resource.eval(Slf4jLogger.fromClass[F](classOf[EventConsumer[F, K, V]]))
     } yield {
       given Random[F] = random
-      new EventConsumer(config, keyDeserializer, valueDeserializer, dlq, logger)
+      new EventConsumer(config, keyDeserializer, valueDeserializer, dlq, logger, tracing)
     }
   }
 

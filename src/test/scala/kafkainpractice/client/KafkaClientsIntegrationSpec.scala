@@ -13,10 +13,16 @@ import cats.syntax.all.*
 import fs2.kafka.*
 import fs2.Chunk
 
+import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator
+import io.opentelemetry.api.common.AttributeKey
+import io.opentelemetry.api.trace.SpanKind
+import io.opentelemetry.sdk.trace.data.SpanData
 import munit.CatsEffectSuite
 import org.apache.kafka.clients.admin.{Admin, NewTopic}
 import org.apache.kafka.common.test.{KafkaClusterTestKit, TestKitNodes}
 import org.apache.kafka.common.TopicPartition
+import org.typelevel.otel4s.oteljava.testkit.trace.TracesTestkit
+import org.typelevel.otel4s.trace.TracerProvider
 
 /**
   * Runs the producer and consumer against a real single-node KRaft cluster in this JVM.
@@ -79,7 +85,9 @@ class KafkaClientsIntegrationSpec extends CatsEffectSuite {
         .map(_.asScala.collect { case (tp, om) if om != null => tp -> om.offset }.toMap)
     }
 
-  private def produce(topic: String, records: List[(String, String)]): IO[Unit] =
+  private def produce(topic: String, records: List[(String, String)])(using
+      Tracing[IO]
+  ): IO[Unit] =
     EventProducer
       .resource(
         ProducerConfig(connection(unique("producer"))),
@@ -105,7 +113,7 @@ class KafkaClientsIntegrationSpec extends CatsEffectSuite {
       config: ConsumerConfig,
       valueDeserializer: ValueDeserializer[IO, V],
       done: IO[Boolean]
-  )(handler: ConsumerRecord[String, V] => IO[Unit]): IO[Unit] =
+  )(handler: ConsumerRecord[String, V] => IO[Unit])(using Tracing[IO]): IO[Unit] =
     EventConsumer.resource(config, Deserializer.string[IO], valueDeserializer).use { consumer =>
       consumer.run(handler).background.use { outcome =>
         val finishedEarly =
@@ -255,6 +263,84 @@ class KafkaClientsIntegrationSpec extends CatsEffectSuite {
       assertEquals(seen, Vector("ok-1", "ok-2"), "nothing after the poison record was handled")
       assert(committed.values.forall(_ <= 2L), s"committed past the failing record: $committed")
     }
+  }
+
+  test("traces each record from producer to process, with retries and the dead-letter send") {
+    val topic = unique("traced")
+    val dlq   = s"$topic.dlq"
+    val group = unique("traced-group")
+    // W3C trace context in the record headers is what links consumer spans to producer spans.
+    TracesTestkit
+      .inMemory[IO](_.addTextMapPropagators(W3CTraceContextPropagator.getInstance))
+      .use { testkit =>
+        given TracerProvider[IO] = testkit.tracerProvider
+        for {
+          tracing           <- Tracing.create[IO]()
+          given Tracing[IO]  = tracing
+          _                 <- createTopic(topic, partitions = 1)
+          _                 <- produce(topic, List("a" -> "ok", "b" -> "fail"))
+          handled           <- Ref[IO].of(Set.empty[String])
+          attempts          <- Ref[IO].of(0)
+          _                 <- consumeUntil(
+                 consumerConfig(topic, group, Some(dlq)),
+                 Deserializer.string[IO],
+                 (handled.get, attempts.get).mapN((h, n) => h("ok") && n == 3)
+               ) { r =>
+                 if r.value == "fail" then
+                   attempts.update(_ + 1) >> IO.raiseError(new RuntimeException("downstream down"))
+                 else handled.update(_ + r.value)
+               }
+          _     <- readAll(dlq, 1)
+          spans <- testkit.finishedSpans
+        } yield {
+          // -language:strictEquality: Java enums need an explicit CanEqual.
+          given CanEqual[SpanKind, SpanKind] = CanEqual.derived
+          def named(name: String)             = spans.filter(_.getName == name)
+          def events(span: SpanData, name: String) =
+            span.getEvents.asScala.filter(_.getName == name).toList
+
+          // Both records went out in one batch (BatchSpanMode.PerRecordSpans, the default): one
+          // CLIENT send span for the request, plus a PRODUCER create span per record whose context
+          // is written into that record's headers.
+          val sends = named(s"send $topic")
+          assertEquals(sends.size, 1, "one send span for the batch")
+          assert(sends.forall(_.getKind == SpanKind.CLIENT))
+          val creates = named(s"create $topic")
+          assertEquals(creates.size, 2, "one create span per record")
+          assert(creates.forall(_.getKind == SpanKind.PRODUCER))
+
+          val processes = named(s"process $topic")
+          assertEquals(processes.size, 2, "one process span per consumed record")
+          assert(processes.forall(_.getKind == SpanKind.CONSUMER))
+          val createIds = creates.map(_.getSpanContext.getSpanId).toSet
+          assert(
+            processes.forall(_.getLinks.asScala.exists(l => createIds(l.getSpanContext.getSpanId))),
+            "each process span links to the create span whose context its record carried"
+          )
+
+          val failed = processes.find(events(_, "kafkainpractice.dead_letter").nonEmpty)
+          assert(failed.isDefined, "the failing record's process span has a dead_letter event")
+          val failedSpan = failed.get
+          assertEquals(events(failedSpan, "kafkainpractice.retry").size, 2, "two retries")
+          val deadLetter = events(failedSpan, "kafkainpractice.dead_letter").head.getAttributes
+          assertEquals(deadLetter.get(AttributeKey.stringKey("kafkainpractice.dead_letter.topic")), dlq)
+          assertEquals(deadLetter.get(AttributeKey.stringKey("kafkainpractice.dead_letter.stage")), "Handler")
+          assertEquals(
+            deadLetter.get(AttributeKey.longKey("kafkainpractice.dead_letter.attempts")),
+            java.lang.Long.valueOf(3L)
+          )
+
+          val dlqSend = named(s"send $dlq")
+          assertEquals(dlqSend.size, 1, "one dead-letter send")
+          assertEquals(
+            dlqSend.head.getParentSpanId,
+            failedSpan.getSpanContext.getSpanId,
+            "the dead-letter send is a child of the failed record's process span"
+          )
+
+          assert(spans.exists(_.getName.startsWith("commit")), "offset commits are traced")
+        }
+      }
   }
 
 }

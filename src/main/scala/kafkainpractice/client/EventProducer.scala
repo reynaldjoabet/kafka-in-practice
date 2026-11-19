@@ -7,6 +7,7 @@ import cats.syntax.all.*
 import cats.Parallel
 import fs2.{Chunk, Pipe}
 import fs2.kafka.*
+import fs2.kafka.otel4s.trace.KafkaMessageKey
 
 import org.apache.kafka.clients.producer.{ProducerConfig as KafkaProducerConfig, RecordMetadata}
 
@@ -46,6 +47,9 @@ final case class ProducerConfig(
   *
   * Every `send` method returns only after the brokers have acknowledged the records, so a
   * successful result means the records are durably written (`acks=all`).
+  *
+  * With a [[Tracing]] in scope, every send creates a `send <topic>` span and writes its trace context
+  * into the record headers, so consumers can link their processing to it.
   */
 final class EventProducer[F[_]: Async, K, V] private (producer: KafkaProducer[F, K, V]) {
 
@@ -98,14 +102,24 @@ enum Compression(val configValue: String) {
 
 object EventProducer {
 
+  /**
+    * @param tracing
+    *   no-op unless the caller has a `given Tracing[F]`
+    * @param messageKey
+    *   how a key becomes the span attribute `messaging.kafka.message.key`. Instances exist for
+    *   String, Int, Long and UUID; for other key types the attribute is omitted
+    */
   def resource[F[_]: Async: Parallel, K, V](
       config: ProducerConfig,
       keySerializer: KeySerializer[F, K],
       valueSerializer: ValueSerializer[F, V]
+  )(using
+      tracing: Tracing[F],
+      messageKey: KafkaMessageKey[K] = Tracing.unknownKey[K]
   ): Resource[F, EventProducer[F, K, V]] =
     KafkaProducer
       .resource(settings(config, keySerializer, valueSerializer))
-      .map(new EventProducer(_))
+      .map(producer => new EventProducer(tracing.kafka.producer(producer)))
 
   def settings[F[_], K, V](
       config: ProducerConfig,
