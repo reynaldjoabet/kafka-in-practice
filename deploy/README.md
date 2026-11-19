@@ -267,6 +267,37 @@ Label the application's namespace so the NetworkPolicy lets it in:
 kubectl label namespace my-app kafka-access=true
 ```
 
+How a client finds the brokers:
+
+```
+ namespace my-app (labelled kafka-access=true)          namespace kafka
+ ┌──────────────────────┐
+ │ application pod      │  1. bootstrap.servers=kafka.kafka.svc:9092
+ │                      │ ─────────────────────────────► Service/kafka (ClusterIP 10.x.x.x:9092)
+ │                      │                                      │ kube-proxy picks ANY ready broker
+ │                      │                                      ▼
+ │                      │                              ┌─────────────────┐
+ │                      │  2. Metadata response ◄──────│ kafka-broker-1  │ (any broker can answer)
+ │                      │     "orders-0 → broker 101 at kafka-broker-0.kafka-broker-headless…:9092
+ │                      │      orders-1 → broker 102 at kafka-broker-1.kafka-broker-headless…:9092
+ │                      │      orders-2 → broker 103 at kafka-broker-2.kafka-broker-headless…:9092"
+ │                      │
+ │                      │  3. DNS: kafka-broker-0.kafka-broker-headless.kafka.svc.cluster.local
+ │                      │     → Service/kafka-broker-headless (clusterIP: None) → that ONE pod's IP
+ │                      │
+ │                      │  4. Produce/Fetch go straight to the partition leader's pod IP
+ │                      │ ───────────────────────────────────────────────► kafka-broker-0 (leads orders-0)
+ │                      │ ───────────────────────────────────────────────► kafka-broker-1 (leads orders-1)
+ │                      │ ───────────────────────────────────────────────► kafka-broker-2 (leads orders-2)
+ └──────────────────────┘
+   every connection is SASL_SSL on port 9092, allowed by the NetworkPolicy
+   because the namespace carries kafka-access=true
+```
+
+- `Service/kafka` (ClusterIP) is used **only for bootstrap**. Any broker can answer a `Metadata` request, so load balancing is fine there.
+- After that the client connects to **each broker directly**, using the address the broker *advertises* (`advertised.listeners` = its pod DNS name). Those names come from the **headless** Service, which resolves to one pod's IP with no load balancing. The client must reach a specific broker, because only a partition's leader accepts its writes; going through the ClusterIP for everything would land requests on the wrong broker and get `NOT_LEADER_OR_FOLLOWER`.
+- The same applies to the admin listener (`INTERNAL`, 9091) used by `kafka-init`: it bootstraps from the brokers' headless names directly.
+
 Then use `bootstrap.servers=kafka.kafka.svc:9092` with the same SASL_SSL settings as above, and mount `ca.crt` (for example by copying the `kafka-node-tls` secret's `ca.crt` key into your namespace).
 
 Brokers advertise their pod DNS names, so `kubectl port-forward` is not enough for clients outside the cluster. For external access, add an `EXTERNAL` listener per broker behind a LoadBalancer or NodePort Service and advertise those addresses.
